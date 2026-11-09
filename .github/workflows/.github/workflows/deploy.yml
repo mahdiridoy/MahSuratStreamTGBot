@@ -1,0 +1,47 @@
+name: Deploy MahSurat Stream Bot
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Syntax check all JS files
+        run: |
+          for f in bot.js web.js providers/*.js storage/*.js public/app.js; do
+            node -c "$f" || { echo "❌ Syntax error in $f"; exit 1; }
+          done
+          echo "✅ All JS files pass syntax check"
+
+      - name: Deploy to server (SSH)
+        if: secrets.SSH_HOST != ''
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            cd ${{ secrets.SSH_WORKDIR || '/opt/mahsurat-bot' }}
+            git pull origin main
+            npm ci --no-audit --no-fund
+            pm2 restart mahsurat-bot || pm2 start npm --name mahsurat-bot -- start
+            pm2 save
