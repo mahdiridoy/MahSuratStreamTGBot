@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MahSurat Stream Bot</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="page">
+  <header class="bar">
+    <div class="brand">🎬 MahSurat Stream Bot</div>
+    <div class="subtitle">Search all providers &bull; Play in Telegram video player</div>
+  </header>
+
+  <main class="card">
+    <h1>Stream movies &amp; series in Telegram</h1>
+    <p>Send a title to the bot and get results from <b>all providers</b>. Tap <b>▶️ Play</b> — the video opens in Telegram's built-in video player, which works on every mobile phone.</p>
+
+    <div class="row">
+      <input type="text" id="searchInput" placeholder="e.g. Big Buck Bunny" autocomplete="off">
+      <button class="btn btn-primary" id="openBot">Open in Telegram</button>
+    </div>
+
+    <div class="hint">
+      <b>Inline:</b> in any chat type <code>@mahsurat_stream_bot &lt;query&gt;</code>, pick a result and tap Play.
+    </div>
+
+    <section class="section">
+      <h2>GitHub sync</h2>
+      <p>Link your GitHub account to keep your watchlist (favorites) synced across devices.</p>
+      <a href="/auth/github" class="btn btn-outline" id="ghBtn">Connect GitHub</a>
+    </section>
+
+    <section class="section">
+      <h2>Providers</h2>
+      <p class="small">mock (built-in samples), dramachi, bdix, moviebox — aggregated into one search. Real providers are best-effort scrapers; the mock provider always works.</p>
+    </section>
+  </main>
+
+  <footer class="bar small">
+    MahSurat Stream Bot &middot; self-hostable &middot; <a href="/auth/github">Connect GitHub</a>
+  </footer>
+</div>
+
+<script>
+const BOT_USERNAME = 'mahsurat_stream_bot';
+const tg = document.getElementById('openBot');
+const input = document.getElementById('searchInput');
+tg.addEventListener('click', () => {
+  const q = input.value.trim();
+  const url = q ? `https://t.me/${BOT_USERNAME}?start=search ${encodeURIComponent(q)}` : `https://t.me/${BOT_USERNAME}`;
+  location.href = url;
+});
+input.addEventListener('keydown', e => { if (e.key === 'Enter') tg.click(); });
+</script>
+</body>
+</html>
