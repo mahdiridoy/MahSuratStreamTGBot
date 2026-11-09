@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dashboard — MahSurat Stream Bot</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="page">
+  <header class="bar">
+    <div class="brand">🎬 MahSurat Stream Bot</div>
+    <div class="subtitle">Watchlist &bull; GitHub synced</div>
+  </header>
+
+  <main class="card">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <h1>Your watchlist</h1>
+      <button class="btn btn-outline" onclick="location.href='/'">Open bot in Telegram</button>
+    </div>
+
+    <div class="user-row" id="userRow">
+      <span class="avatar" id="avatar">?</span>
+      <div>
+        <div class="name" id="userName">Loading…</div>
+        <div class="small" id="userLogin"></div>
+      </div>
+      <button class="btn btn-danger" id="logoutBtn">Logout</button>
+    </div>
+
+    <div class="row" style="margin-top:12px">
+      <input type="text" id="addTitle" placeholder="Add a title manually…" autocomplete="off">
+      <button class="btn btn-primary" id="addBtn">Add</button>
+    </div>
+
+    <div id="empty" class="empty" style="display:none">
+      <p>Your watchlist is empty. Search in the bot and tap ⭐ "Add to favorites" on any result.</p>
+    </div>
+
+    <ul class="list" id="favList"></ul>
+  </main>
+
+  <footer class="bar small">
+    Favorites are stored per GitHub account and synced to a secret GitHub Gist when <code>GITHUB_TOKEN</code> is set.
+  </footer>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
