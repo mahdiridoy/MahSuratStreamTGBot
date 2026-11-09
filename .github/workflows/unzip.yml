@@ -1,0 +1,56 @@
+name: Unzip Project & Auto-Delete Zip
+
+on:
+  push:
+    paths:
+      - '**.zip'
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      zip_file:
+        description: 'Zip filename to unzip (leave empty for any *.zip in root)'
+        required: false
+        default: ''
+
+jobs:
+  unzip:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Detect zip file
+        id: detect
+        run: |
+          if [ -n "${{ github.event.inputs.zip_file }}" ]; then
+            ZIP_FILE="${{ github.event.inputs.zip_file }}"
+          else
+            ZIP_FILE=$(ls *.zip 2>/dev/null | head -1 || true)
+          fi
+          if [ -z "$ZIP_FILE" ] || [ ! -f "$ZIP_FILE" ]; then
+            echo "No zip file found in repository root."
+            echo "zip_file=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "Found zip: $ZIP_FILE"
+          echo "zip_file=$ZIP_FILE" >> $GITHUB_OUTPUT
+
+      - name: Unzip project
+        if: steps.detect.outputs.zip_file != ''
+        run: unzip -o "${{ steps.detect.outputs.zip_file }}" -d .
+
+      - name: Delete zip file after extraction
+        if: steps.detect.outputs.zip_file != ''
+        run: rm -f "${{ steps.detect.outputs.zip_file }}"
+
+      - name: Commit extracted files and push
+        if: steps.detect.outputs.zip_file != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: auto-unzip project and remove zip [skip ci]" || echo "Nothing to commit"
+          git push
