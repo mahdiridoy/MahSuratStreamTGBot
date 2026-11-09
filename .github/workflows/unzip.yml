@@ -51,6 +51,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.REPO_PAT }}@github.com/${{ github.repository }}.git"
           git add -A
           git commit -m "chore: auto-unzip project and remove zip [skip ci]" || echo "Nothing to commit"
-          git push
+          git push origin HEAD:${{ github.ref }}
+          
