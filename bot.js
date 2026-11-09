@@ -131,9 +131,9 @@ async function showSearchResults(ctx, query, editMessageId) {
   }
 }
 
-bot.on('message', async ctx => {
+bot.on('text', async ctx => {
   const text = (ctx.message.text || '').trim();
-  if (text.startsWith('/')) return; // commands handled above
+  if (!text || text.startsWith('/')) return; // commands handled above
   await showSearchResults(ctx, text);
 });
 

@@ -54,8 +54,8 @@ class MovieboxProvider extends BaseProvider {
     const title = $('h1').first().text().trim() || id;
     let video_url = $('video source').attr('src') || null;
     if (!video_url) {
-      // video_url = (data.match(/(https?:\/\/[^"'\s]+\.(mp4|m3u8)[^"'\s]*)/i) || [])[1] || null;
-      video_url = null;
+      const m = data.match(/(https?:\/\/[^"'\s]+\.(mp4|m3u8)[^"'\s]*)/i);
+      video_url = m ? m[1] : null;
     }
     const thumbnail = $('meta[property="og:image"]').attr('content') || null;
     return new Stream({

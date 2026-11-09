@@ -66,7 +66,7 @@ class MovieboxProvider extends BaseProvider {
       thumbnail: thumbnail ? new URL(thumbnail, BASE_URL).href : null,
       description: $('meta[property="og:description"]').attr('content') || '',
       quality: 'HD',
-    };
+    });
   }
 }
 
