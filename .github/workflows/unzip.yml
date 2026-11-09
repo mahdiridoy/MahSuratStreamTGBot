@@ -1,58 +1,125 @@
-name: Unzip Project & Auto-Delete Zip
+
+name: Unzip Project & Auto-Delete ZIP
 
 on:
   push:
     paths:
-      - '**.zip'
-    branches: [ main ]
+      - '*.zip'
+    branches:
+      - main
+
   workflow_dispatch:
     inputs:
       zip_file:
-        description: 'Zip filename to unzip (leave empty for any *.zip in root)'
+        description: 'ZIP filename (empty = process all ZIP files in root)'
         required: false
+        type: string
         default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: unzip-project-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   unzip:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.REPO_PAT || secrets.GITHUB_TOKEN }}
 
-      - name: Detect zip file
+      - name: Install unzip
+        run: sudo apt-get update && sudo apt-get install -y unzip
+
+      - name: Detect ZIP files
         id: detect
+        env:
+          INPUT_ZIP: ${{ inputs.zip_file }}
+        shell: bash
         run: |
-          if [ -n "${{ github.event.inputs.zip_file }}" ]; then
-            ZIP_FILE="${{ github.event.inputs.zip_file }}"
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/zip-list"
+          : > "$RUNNER_TEMP/zip-list/files.txt"
+
+          if [[ -n "$INPUT_ZIP" ]]; then
+            if [[ ! -f "$INPUT_ZIP" ]]; then
+              echo "::error::ZIP file not found: $INPUT_ZIP"
+              exit 1
+            fi
+            printf '%s\n' "$INPUT_ZIP" >> "$RUNNER_TEMP/zip-list/files.txt"
           else
-            ZIP_FILE=$(ls *.zip 2>/dev/null | head -1 || true)
+            find . -maxdepth 1 -type f -iname '*.zip' -print0 |
+              while IFS= read -r -d '' file; do
+                printf '%s\n' "${file#./}"
+              done > "$RUNNER_TEMP/zip-list/files.txt"
           fi
-          if [ -z "$ZIP_FILE" ] || [ ! -f "$ZIP_FILE" ]; then
-            echo "No zip file found in repository root."
-            echo "zip_file=" >> $GITHUB_OUTPUT
+
+          if [[ ! -s "$RUNNER_TEMP/zip-list/files.txt" ]]; then
+            echo "::error::No ZIP files found in repository root."
+            exit 1
+          fi
+
+          echo "Found ZIP files:"
+          cat "$RUNNER_TEMP/zip-list/files.txt"
+
+      - name: Validate and extract ZIP files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r ZIP_FILE; do
+            [[ -n "$ZIP_FILE" ]] || continue
+
+            echo "Processing: $ZIP_FILE"
+
+            if ! unzip -t "$ZIP_FILE"; then
+              echo "::error::Invalid ZIP file: $ZIP_FILE"
+              exit 1
+            fi
+
+            # Prevent ZIP path traversal attacks.
+            if unzip -Z1 "$ZIP_FILE" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+              echo "::error::Unsafe ZIP paths detected in $ZIP_FILE"
+              exit 1
+            fi
+
+            # Extract into repository root.
+            unzip -o "$ZIP_FILE" -d .
+
+            # Delete ZIP only after successful extraction.
+            rm -- "$ZIP_FILE"
+
+            echo "Successfully extracted and deleted: $ZIP_FILE"
+
+          done < "$RUNNER_TEMP/zip-list/files.txt"
+
+      - name: Commit and push extracted project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
             exit 0
           fi
-          echo "Found zip: $ZIP_FILE"
-          echo "zip_file=$ZIP_FILE" >> $GITHUB_OUTPUT
 
-      - name: Unzip project
-        if: steps.detect.outputs.zip_file != ''
-        run: unzip -o "${{ steps.detect.outputs.zip_file }}" -d .
+          git commit -m "chore: extract ZIP project and remove archives [skip ci]"
 
-      - name: Delete zip file after extraction
-        if: steps.detect.outputs.zip_file != ''
-        run: rm -f "${{ steps.detect.outputs.zip_file }}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
 
-      - name: Commit extracted files and push
-        if: steps.detect.outputs.zip_file != ''
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin "https://x-access-token:${{ secrets.REPO_PAT }}@github.com/${{ github.repository }}.git"
-          git add -A
-          git commit -m "chore: auto-unzip project and remove zip [skip ci]" || echo "Nothing to commit"
-          git push origin HEAD:${{ github.ref }}
-          
+      - name: Extraction summary
+        if: success()
+        run: echo "ZIP extraction and repository update completed successfully."
+        
