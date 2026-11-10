@@ -1,0 +1,39 @@
+name: Bug report
+description: Report an error, crash, or unexpected behavior.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `moviebox-tui`
+        2. 
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Relevant logs, errors, or screenshots
+      description: Terminal output, error notices, or screenshots (optional).
+    validations:
+      required: false
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Version, OS, and Terminal.
+      placeholder: "v0.1.22, Termux (Android) / macOS Ghostty / Windows Terminal"
+    validations:
+      required: true
