@@ -176,7 +176,7 @@ jobs:
           cat > bucket/moviebox-tgbot.json << JSON
           {
             "version": "$VER",
-            "description": "MovieBox Telegram bot (search all providers, play in Telegram / MX Player / VLC)",
+            "description": "MahSurat Stream Bot (search all providers, play in Telegram / MX Player / VLC)",
             "homepage": "https://github.com/${{ github.repository }}",
             "license": "MIT|Apache-2.0",
             "url": "https://github.com/${{ github.repository }}/releases/download/bot-latest/MovieBoxBot_Windows_x64.zip",

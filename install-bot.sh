@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MovieBox Telegram bot installer (Termux/Android, Linux)
+# MahSurat Stream Bot installer (Termux/Android, Linux)
 set -euo pipefail
 
 REPO="__REPO__"

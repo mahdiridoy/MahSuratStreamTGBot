@@ -225,7 +225,7 @@ async fn show(ctx: &Ctx, chat: i64, msg: Option<i64>, text: &str, markup: Option
     }
 }
 
-const HELP: &str = "<b>MovieBox Bot</b>\n\n\
+const HELP: &str = "<b>MahSurat Stream Bot</b>\n\n\
 Send a movie or series name (or use /search name).\n\
 I search <b>all providers</b>, then you pick:\n\
 1. Provider\n2. Title\n3. Season / Episode (series)\n4. Audio language\n5. Quality / source\n\n\
@@ -1441,7 +1441,7 @@ async fn serve_conn(
         return;
     }
 
-    http_simple(&mut sock, 200, "OK", "text/plain", b"MovieBox bot player server").await;
+    http_simple(&mut sock, 200, "OK", "text/plain", b"MahSurat Stream Bot player server").await;
 }
 
 async fn server_task(listener: tokio::net::TcpListener, streams: StreamMap, tg: Tg) {

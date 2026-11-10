@@ -1,4 +1,4 @@
-# MovieBox Telegram Bot (GitHub Actions)
+# MahSurat Stream Bot (GitHub Actions)
 
 1. Put this project in your GitHub repo (replace the repo contents with this folder).
 2. Repo -> Settings -> Secrets and variables -> Actions

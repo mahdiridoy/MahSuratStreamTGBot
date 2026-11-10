@@ -1,4 +1,4 @@
-# MovieBox Telegram bot installer (Windows PowerShell)
+# MahSurat Stream Bot installer (Windows PowerShell)
 param([string]$InstallDir = "")
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
