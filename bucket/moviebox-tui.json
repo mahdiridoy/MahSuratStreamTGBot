@@ -8,12 +8,12 @@
   },
   "architecture": {
     "64bit": {
-      "url": "https://github.com/mahdiridoy/MahSuratStreamTGBot/releases/download/v0.1.29/MovieBox_Windows_x64.zip",
-      "hash": "f1ae27c1185712df1dfd82b4b0327bfc017934e410435a491802825594cd791e"
+      "url": "https://github.com/mesamirh/MovieBox-Tui/releases/download/v0.1.29/MovieBox_Windows_x64.zip",
+      "hash": "079fbbda6e535b19ac797fd380fb7b6b7605ce4e68eb57060f0404b29eaffc2b"
     },
     "arm64": {
-      "url": "https://github.com/mahdiridoy/MahSuratStreamTGBot/releases/download/v0.1.29/MovieBox_Windows_arm64.zip",
-      "hash": "603f23b751d74ab0fc8b70dec8c3d4d256c565b8cf8fdd60a329e9754812205a"
+      "url": "https://github.com/mesamirh/MovieBox-Tui/releases/download/v0.1.29/MovieBox_Windows_arm64.zip",
+      "hash": "da516b7fd19b317302726fb958f04702a09b141e79ba3a0c19f9f935df44fe1f"
     }
   },
   "bin": "moviebox-tui.exe",

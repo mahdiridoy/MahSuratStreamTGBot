@@ -136,6 +136,9 @@ struct Ctx {
     svc: MovieBoxService,
     states: Arc<Mutex<HashMap<i64, ChatState>>>,
     allowed: Arc<Vec<i64>>,
+    /// Public https base of the built-in stream server (cloudflared quick tunnel)
+    base: Arc<Mutex<Option<String>>>,
+    streams: StreamMap,
 }
 
 fn st_get(ctx: &Ctx, chat: i64) -> ChatState {
@@ -253,7 +256,13 @@ async fn do_search(ctx: &Ctx, chat: i64, query: &str) {
         let (items, err) = match r {
             Ok(Ok(v)) => (v, None),
             Ok(Err(ProviderError::NotFound)) => (Vec::new(), None),
-            Ok(Err(e)) => (Vec::new(), Some(e.user_message(p))),
+            Ok(Err(e)) => {
+                let mut m = e.user_message(p);
+                if p.is_bdix() {
+                    m.push_str(" (BDIX works only when the bot runs on a BDIX connection - install it on your PC/phone, see TELEGRAM_BOT.md)");
+                }
+                (Vec::new(), Some(m))
+            }
             Err(_) => (Vec::new(), Some(format!("{} timed out.", p.label()))),
         };
         results.push((p, items, err));
@@ -765,31 +774,40 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
         esc(&rel_label(&rel))
     );
     let mut rows: Vec<Vec<Value>> = Vec::new();
+    let base = ctx.base.lock().ok().and_then(|g| g.clone());
     for (i, (label, url, headers)) in links.iter().enumerate() {
         let name = if label.trim().is_empty() {
             format!("Link {}", i + 1)
         } else {
             short(label, 30)
         };
-        text.push_str(&format!("\n<b>{}</b>\n<code>{}</code>", esc(&name), esc(url)));
-        if !headers.is_empty() {
-            let h: Vec<String> = headers
-                .iter()
-                .filter(|(n, _)| {
-                    n.eq_ignore_ascii_case("referer") || n.eq_ignore_ascii_case("user-agent")
-                })
-                .map(|(n, v)| format!("{n}: {}", short(v, 120)))
-                .collect();
-            if !h.is_empty() {
-                text.push_str(&format!(
-                    "\n<i>needs headers:</i> <code>{}</code>",
-                    esc(&h.join(" | "))
-                ));
+        text.push_str(&format!("\n<b>{}</b>", esc(&name)));
+        if let Some(base) = base.as_ref() {
+            let sid = register_stream(
+                &ctx.streams,
+                Stream {
+                    url: url.clone(),
+                    headers: headers.clone(),
+                    title: format!("{}{}", title, episode_tag(&st)),
+                },
+            );
+            let page = format!("{}/p/{}", base.trim_end_matches('/'), sid);
+            text.push_str("\nTap a button below to play.\n");
+            rows.push(vec![json!({"text": format!("▶️ Play in Telegram: {name}"), "web_app": {"url": page.clone()}})]);
+            rows.push(vec![
+                json!({"text": "📱 MX Player", "url": format!("{page}?go=mx")}),
+                json!({"text": "🎞 VLC", "url": format!("{page}?go=vlc")}),
+            ]);
+        } else {
+            text.push_str(&format!("\n<code>{}</code>", esc(url)));
+            if headers.iter().any(|(n, _)| {
+                n.eq_ignore_ascii_case("referer") || n.eq_ignore_ascii_case("user-agent")
+            }) {
+                text.push_str("\n⚠️ <i>This link needs special headers (browser shows ACCESS DENIED). The player server is still starting - tap the quality again in a minute.</i>");
+            } else if url.starts_with("http") {
+                rows.push(vec![json!({"text": format!("▶️ Open: {name}"), "url": url})]);
             }
-        }
-        text.push('\n');
-        if url.starts_with("http") {
-            rows.push(vec![json!({"text": format!("▶️ Open: {name}"), "url": url})]);
+            text.push('\n');
         }
     }
 
@@ -981,33 +999,424 @@ async fn handle_update(ctx: Ctx, upd: Value) {
     }
 }
 
+// ----------------------------------------------- Built-in player/stream server
+
+#[derive(Clone)]
+struct Stream {
+    url: String,
+    headers: Vec<(String, String)>,
+    title: String,
+}
+
+type StreamMap = Arc<Mutex<HashMap<String, Stream>>>;
+
+fn random_id() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    // RandomState is seeded from the OS RNG on every platform.
+    let mut out = String::new();
+    for i in 0u8..2 {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u8(i);
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        out.push_str(&format!("{:016x}", h.finish()));
+    }
+    out
+}
+
+fn register_stream(map: &StreamMap, st: Stream) -> String {
+    let id = random_id();
+    if let Ok(mut g) = map.lock() {
+        if g.len() > 2000 {
+            g.clear();
+        }
+        g.insert(id.clone(), st);
+    }
+    id
+}
+
+const PLAYER_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+body{margin:0;background:#0f0f14;color:#eee;font-family:system-ui,sans-serif}
+h1{font-size:16px;margin:12px;font-weight:600}
+video{width:100%;max-height:70vh;background:#000}
+.row{display:flex;gap:8px;margin:12px}
+a.b{flex:1;text-align:center;padding:12px;border-radius:10px;background:#2b6cff;color:#fff;text-decoration:none;font-weight:600}
+a.v{background:#e8730c}
+p{margin:12px;font-size:13px;color:#aaa}
+</style></head><body>
+<h1>__TITLE__</h1>
+<video id="v" controls autoplay playsinline src="/s/__ID__"></video>
+<div class="row"><a class="b" id="mx" href="#">MX Player</a><a class="b v" id="vlc" href="#">VLC</a></div>
+<p id="msg">If the video does not start here (some formats are not supported by the in-app player), use MX Player or VLC.</p>
+<script>
+var TITLE=__TITLE_JS__, GO="__GO__";
+var tg=window.Telegram&&window.Telegram.WebApp;
+if(tg){try{tg.ready();tg.expand();}catch(e){}}
+var inTg=!!(tg&&tg.initData);
+var abs=location.origin+"/s/__ID__";
+function intentFor(pkg){return "intent://"+abs.replace(/^https?:\/\//,"")+"#Intent;scheme=https;package="+pkg+";type=video/*;S.title="+encodeURIComponent(TITLE)+";end";}
+var PK={mx:"com.mxtech.videoplayer.ad",vlc:"org.videolan.vlc"};
+function launch(k){
+  if(inTg&&tg.openLink){tg.openLink(location.origin+"/p/__ID__?go="+k);return;}
+  location.href=intentFor(PK[k]);
+}
+document.getElementById("mx").onclick=function(e){e.preventDefault();launch("mx");};
+document.getElementById("vlc").onclick=function(e){e.preventDefault();launch("vlc");};
+document.getElementById("v").addEventListener("error",function(){document.getElementById("msg").textContent="This video format cannot play in-app. Tap MX Player or VLC above.";});
+if(GO&&PK[GO]&&!inTg){document.getElementById("v").pause();setTimeout(function(){location.href=intentFor(PK[GO]);},300);}
+</script></body></html>"#;
+
+fn player_page(id: &str, title: &str, go: &str) -> String {
+    let title_js = serde_json::to_string(title)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace("</", "<\\/");
+    let go = if go == "mx" || go == "vlc" { go } else { "" };
+    PLAYER_HTML
+        .replace("__TITLE_JS__", &title_js)
+        .replace("__TITLE__", &esc(title))
+        .replace("__ID__", id)
+        .replace("__GO__", go)
+}
+
+async fn http_simple(
+    sock: &mut tokio::net::TcpStream,
+    code: u16,
+    reason: &str,
+    ctype: &str,
+    body: &[u8],
+) {
+    use tokio::io::AsyncWriteExt;
+    let head = format!(
+        "HTTP/1.1 {code} {reason}\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = sock.write_all(head.as_bytes()).await;
+    let _ = sock.write_all(body).await;
+    let _ = sock.flush().await;
+}
+
+async fn serve_conn(mut sock: tokio::net::TcpStream, streams: StreamMap, http: reqwest::Client) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 2048];
+    loop {
+        match sock.read(&mut tmp).await {
+            Ok(0) => return,
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if buf.len() > 16384 {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+    let head = String::from_utf8_lossy(&buf).to_string();
+    let mut lines = head.split("\r\n");
+    let first = lines.next().unwrap_or("").to_string();
+    let mut it = first.split_whitespace();
+    let method = it.next().unwrap_or("").to_string();
+    let target = it.next().unwrap_or("/").to_string();
+    let mut range: Option<String> = None;
+    for l in lines {
+        if let Some((n, v)) = l.split_once(':') {
+            if n.trim().eq_ignore_ascii_case("range") {
+                range = Some(v.trim().to_string());
+            }
+        }
+    }
+    let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+    let get = |id: &str| -> Option<Stream> { streams.lock().ok().and_then(|g| g.get(id).cloned()) };
+
+    if let Some(id) = path.strip_prefix("/p/") {
+        let Some(entry) = get(id) else {
+            http_simple(&mut sock, 404, "Not Found", "text/plain", b"Expired. Search again in the bot.").await;
+            return;
+        };
+        let go = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("go="))
+            .unwrap_or("");
+        let html = player_page(id, &entry.title, go);
+        http_simple(&mut sock, 200, "OK", "text/html; charset=utf-8", html.as_bytes()).await;
+        return;
+    }
+
+    if let Some(id) = path.strip_prefix("/s/") {
+        let Some(entry) = get(id) else {
+            http_simple(&mut sock, 404, "Not Found", "text/plain", b"Expired").await;
+            return;
+        };
+        let mut req = http.get(&entry.url);
+        for (n, v) in &entry.headers {
+            req = req.header(n.as_str(), v.as_str());
+        }
+        if let Some(r) = &range {
+            req = req.header("Range", r.as_str());
+        }
+        let mut resp = match req.send().await {
+            Ok(r) => r,
+            Err(_) => {
+                http_simple(&mut sock, 502, "Bad Gateway", "text/plain", b"upstream error").await;
+                return;
+            }
+        };
+        let status = resp.status();
+        let mut out = format!(
+            "HTTP/1.1 {} {}\r\n",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("OK")
+        );
+        let mut has_ct = false;
+        for name in [
+            "content-type",
+            "content-length",
+            "content-range",
+            "accept-ranges",
+            "last-modified",
+            "etag",
+        ] {
+            if let Some(v) = resp.headers().get(name).and_then(|v| v.to_str().ok()) {
+                if name == "content-type" {
+                    has_ct = true;
+                }
+                out.push_str(&format!("{name}: {v}\r\n"));
+            }
+        }
+        if !has_ct {
+            out.push_str("content-type: video/mp4\r\n");
+        }
+        out.push_str("access-control-allow-origin: *\r\nconnection: close\r\n\r\n");
+        if sock.write_all(out.as_bytes()).await.is_err() {
+            return;
+        }
+        if method == "HEAD" {
+            return;
+        }
+        while let Ok(Some(chunk)) = resp.chunk().await {
+            if sock.write_all(&chunk).await.is_err() {
+                return;
+            }
+        }
+        let _ = sock.flush().await;
+        return;
+    }
+
+    http_simple(&mut sock, 200, "OK", "text/plain", b"MovieBox bot player server").await;
+}
+
+async fn server_task(listener: tokio::net::TcpListener, streams: StreamMap) {
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .user_agent("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36")
+        .build()
+        .unwrap_or_default();
+    loop {
+        match listener.accept().await {
+            Ok((sock, _)) => {
+                tokio::spawn(serve_conn(sock, streams.clone(), http.clone()));
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+}
+
+fn extract_tunnel(line: &str) -> Option<String> {
+    let i = line.find("https://")?;
+    let rest = &line[i..];
+    let suffix = ".trycloudflare.com";
+    let end = rest.find(suffix)? + suffix.len();
+    let url = rest[..end].to_string();
+    if url.contains("://api.") {
+        None
+    } else {
+        Some(url)
+    }
+}
+
+/// Keeps a free cloudflared "quick tunnel" alive and publishes its https URL in `base`.
+async fn tunnel_task(base: Arc<Mutex<Option<String>>>, port: u16) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let bin = std::env::var("CLOUDFLARED_BIN").unwrap_or_else(|_| {
+        let name = if cfg!(windows) { "cloudflared.exe" } else { "cloudflared" };
+        std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(|d| d.join(name)))
+            .filter(|p| p.exists())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "cloudflared".to_string())
+    });
+    loop {
+        let spawned = tokio::process::Command::new(&bin)
+            .args([
+                "tunnel",
+                "--no-autoupdate",
+                "--url",
+                &format!("http://127.0.0.1:{port}"),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn();
+        let mut child = match spawned {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("cloudflared not available: {e}");
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                continue;
+            }
+        };
+        let Some(stderr) = child.stderr.take() else {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            continue;
+        };
+        let mut lines = BufReader::new(stderr).lines();
+        let found = tokio::time::timeout(Duration::from_secs(45), async {
+            while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(u) = extract_tunnel(&line) {
+                    return Some(u);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(u) = found {
+            println!("Tunnel ready");
+            if let Ok(mut g) = base.lock() {
+                *g = Some(u);
+            }
+            // drain logs until the tunnel process ends
+            while let Ok(Some(_)) = lines.next_line().await {}
+        }
+        let _ = child.kill().await;
+        if let Ok(mut g) = base.lock() {
+            *g = None;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
 // ------------------------------------------------------------------- Main
+
+fn config_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("moviebox-tgbot").join("config.txt"))
+}
+
+/// config.txt lines: token=...  allow=id1,id2
+fn read_config(key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(config_path()?).ok()?;
+    text.lines()
+        .filter_map(|l| l.split_once('='))
+        .find(|(k, _)| k.trim() == key)
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn write_config(token: &str, allow: &str) {
+    if let Some(p) = config_path() {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&p, format!("token={token}\nallow={allow}\n"));
+    }
+}
 
 #[tokio::main]
 async fn main() {
-    let token = match std::env::var("BOT_TOKEN") {
-        Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
-        _ => {
-            eprintln!("BOT_TOKEN is not set");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut arg_token: Option<String> = None;
+    let mut arg_allow: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--token" if i + 1 < args.len() => {
+                arg_token = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--allow" if i + 1 < args.len() => {
+                arg_allow = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--help" | "-h" => {
+                println!("moviebox-tgbot [--token BOT_TOKEN] [--allow CHAT_ID,CHAT_ID]\n\nThe token and allowed ids are saved, so next time just run: moviebox-tgbot");
+                return;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let env_token = std::env::var("BOT_TOKEN").ok().filter(|t| !t.trim().is_empty());
+    let mut token = arg_token.or(env_token).or_else(|| read_config("token"));
+    if token.is_none() {
+        use std::io::{BufRead, IsTerminal, Write};
+        if std::io::stdin().is_terminal() {
+            print!("Paste your Telegram bot token (from @BotFather): ");
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            let _ = std::io::stdin().lock().read_line(&mut line);
+            let t = line.trim().to_string();
+            if !t.is_empty() {
+                token = Some(t);
+            }
+        }
+    }
+    let token = match token {
+        Some(t) => t.trim().to_string(),
+        None => {
+            eprintln!("BOT_TOKEN is not set (use --token or the BOT_TOKEN variable)");
             std::process::exit(1);
         }
     };
-    let allowed: Vec<i64> = std::env::var("ALLOWED_CHAT_IDS")
-        .unwrap_or_default()
+    let allow_raw = arg_allow
+        .or_else(|| std::env::var("ALLOWED_CHAT_IDS").ok().filter(|v| !v.trim().is_empty()))
+        .or_else(|| read_config("allow"))
+        .unwrap_or_default();
+    let on_github = std::env::var("GITHUB_ACTIONS").is_ok();
+    if !on_github {
+        write_config(&token, &allow_raw);
+    }
+    let allowed: Vec<i64> = allow_raw
         .split(',')
         .filter_map(|s| s.trim().parse::<i64>().ok())
         .collect();
-    let run_minutes: u64 = std::env::var("RUN_MINUTES")
+    // On GitHub the run window is limited; on your own PC/phone it runs until you stop it.
+    let run_minutes: Option<u64> = std::env::var("RUN_MINUTES")
         .ok()
         .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(350);
+        .or(if on_github { Some(345) } else { None });
 
     let ctx = Ctx {
         tg: Tg::new(&token),
         svc: MovieBoxService::new(),
         states: Arc::new(Mutex::new(HashMap::new())),
         allowed: Arc::new(allowed),
+        base: Arc::new(Mutex::new(None)),
+        streams: Arc::new(Mutex::new(HashMap::new())),
     };
+
+    match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => {
+            let port = listener.local_addr().map(|a| a.port()).unwrap_or(8787);
+            tokio::spawn(server_task(listener, ctx.streams.clone()));
+            tokio::spawn(tunnel_task(ctx.base.clone(), port));
+        }
+        Err(e) => eprintln!("player server failed to start: {e}"),
+    }
 
     let _ = ctx
         .tg
@@ -1025,11 +1434,11 @@ async fn main() {
         )
         .await;
 
-    println!("Bot started; running for {run_minutes} minutes");
-    let deadline = Instant::now() + Duration::from_secs(run_minutes * 60);
+    println!("Bot started ({})", if on_github { "GitHub Actions" } else { "local" });
+    let deadline: Option<Instant> = run_minutes.map(|m| Instant::now() + Duration::from_secs(m * 60));
     let mut offset: i64 = 0;
 
-    while Instant::now() < deadline {
+    while deadline.is_none_or(|d| Instant::now() < d) {
         let body = json!({
             "offset": offset,
             "timeout": 30,
@@ -1048,7 +1457,14 @@ async fn main() {
             }
             Err(e) => {
                 eprintln!("getUpdates error: {e}");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                if e.contains("Conflict") {
+                    // Another instance (GitHub vs your PC/phone) is polling the same bot.
+                    // The GitHub copy steps aside so your local BDIX-capable copy wins.
+                    let wait = if on_github { 300 } else { 2 };
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                } else {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
             }
         }
     }
