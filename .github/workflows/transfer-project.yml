@@ -1,3 +1,4 @@
+
 name: Transfer MovieBox Project to Root
 
 on:
@@ -5,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  workflows: write
 
 jobs:
   transfer:
@@ -15,29 +17,23 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          ref: main
 
       - name: Verify Source Folder
         run: |
-          if [ ! -d "MovieBox-Tui-main" ]; then
-            echo "ERROR: MovieBox-Tui-main folder not found!"
+          test -d MovieBox-Tui-main || {
+            echo "Source folder not found!"
             exit 1
-          fi
+          }
 
-          if [ -z "$(find MovieBox-Tui-main -mindepth 1 -print -quit)" ]; then
-            echo "ERROR: Source folder is empty!"
+          test -n "$(find MovieBox-Tui-main -mindepth 1 -print -quit)" || {
+            echo "Source folder is empty!"
             exit 1
-          fi
+          }
 
-      - name: Transfer All Files to Repository Root
+      - name: Transfer All Files
         run: |
-          echo "Transferring project files..."
-
           cp -a MovieBox-Tui-main/. .
-
-          echo "Transfer completed."
-
-      - name: Remove Original Source Folder
-        run: |
           rm -rf MovieBox-Tui-main
 
       - name: Commit and Push
@@ -49,16 +45,13 @@ jobs:
 
           if git diff --cached --quiet; then
             echo "No changes detected."
-          else
-            git commit -m "chore: move MovieBox project to repository root"
-            git push origin HEAD:${GITHUB_REF_NAME}
+            exit 0
           fi
 
-      - name: Transfer Summary
-        run: |
-          echo "================================"
-          echo "MovieBox Project Transfer Done"
-          echo "================================"
-          echo "All source files moved to root."
-          echo "Original folder removed."
-          
+          git commit -m "chore: move MovieBox project to repository root"
+
+          git push origin HEAD:main
+
+      - name: Success
+        run: echo "MovieBox project successfully transferred!"
+        
