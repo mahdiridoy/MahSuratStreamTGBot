@@ -40,3 +40,8 @@ Scoop:    scoop bucket add moviebox-bot https://github.com/<OWNER>/<REPO>
 Then run `moviebox-tgbot` (asks for the token once, remembers it).
 
 If both the GitHub copy and your device run at once, your device wins (the GitHub copy backs off for 5 minutes).
+
+## Ad unlock
+Every time you tap a quality/source the bot shows "Watch 2 ads to unlock". The ad page uses the
+libtl.com SDK (zone 12229158). After both ads the Play / MX Player / VLC buttons appear in the chat message.
+After 6 hours the buttons disappear and the link stops working; tap the source again and watch 2 ads.

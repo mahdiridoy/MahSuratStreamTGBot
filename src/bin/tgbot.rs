@@ -256,13 +256,7 @@ async fn do_search(ctx: &Ctx, chat: i64, query: &str) {
         let (items, err) = match r {
             Ok(Ok(v)) => (v, None),
             Ok(Err(ProviderError::NotFound)) => (Vec::new(), None),
-            Ok(Err(e)) => {
-                let mut m = e.user_message(p);
-                if p.is_bdix() {
-                    m.push_str(" (BDIX works only when the bot runs on a BDIX connection - install it on your PC/phone, see TELEGRAM_BOT.md)");
-                }
-                (Vec::new(), Some(m))
-            }
+            Ok(Err(e)) => (Vec::new(), Some(e.user_message(p))),
             Err(_) => (Vec::new(), Some(format!("{} timed out.", p.label()))),
         };
         results.push((p, items, err));
@@ -282,6 +276,9 @@ async fn show_providers(ctx: &Ctx, chat: i64, msg: Option<i64>) {
     let mut rows: Vec<Vec<Value>> = Vec::new();
     let mut any = false;
     for (i, (p, items, err)) in st.results.iter().enumerate() {
+        if p.is_bdix() && items.is_empty() {
+            continue; // never show BDIX warnings
+        }
         if !items.is_empty() {
             any = true;
             text.push_str(&format!("\n✅ {}: {} result(s)", p.label(), items.len()));
@@ -773,43 +770,33 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
         esc(&episode_tag(&st)),
         esc(&rel_label(&rel))
     );
-    let mut rows: Vec<Vec<Value>> = Vec::new();
     let base = ctx.base.lock().ok().and_then(|g| g.clone());
+    let Some(base) = base else {
+        show(
+            ctx,
+            chat,
+            wait,
+            "⏳ The player is still starting up. Please tap the quality again in a minute.",
+            None,
+        )
+        .await;
+        return;
+    };
+    let mut items: Vec<StreamItem> = Vec::new();
     for (i, (label, url, headers)) in links.iter().enumerate() {
         let name = if label.trim().is_empty() {
             format!("Link {}", i + 1)
         } else {
             short(label, 30)
         };
-        text.push_str(&format!("\n<b>{}</b>", esc(&name)));
-        if let Some(base) = base.as_ref() {
-            let sid = register_stream(
-                &ctx.streams,
-                Stream {
-                    url: url.clone(),
-                    headers: headers.clone(),
-                    title: format!("{}{}", title, episode_tag(&st)),
-                },
-            );
-            let page = format!("{}/p/{}", base.trim_end_matches('/'), sid);
-            text.push_str("\nTap a button below to play.\n");
-            rows.push(vec![json!({"text": format!("▶️ Play in Telegram: {name}"), "web_app": {"url": page.clone()}})]);
-            rows.push(vec![
-                json!({"text": "📱 MX Player", "url": format!("{page}?go=mx")}),
-                json!({"text": "🎞 VLC", "url": format!("{page}?go=vlc")}),
-            ]);
-        } else {
-            text.push_str(&format!("\n<code>{}</code>", esc(url)));
-            if headers.iter().any(|(n, _)| {
-                n.eq_ignore_ascii_case("referer") || n.eq_ignore_ascii_case("user-agent")
-            }) {
-                text.push_str("\n⚠️ <i>This link needs special headers (browser shows ACCESS DENIED). The player server is still starting - tap the quality again in a minute.</i>");
-            } else if url.starts_with("http") {
-                rows.push(vec![json!({"text": format!("▶️ Open: {name}"), "url": url})]);
-            }
-            text.push('\n');
-        }
+        text.push_str(&format!("\n• {}", esc(&name)));
+        items.push(StreamItem {
+            name,
+            url: url.clone(),
+            headers: headers.clone(),
+        });
     }
+    text.push('\n');
 
     // Subtitles (MovieBox)
     if st.provider == ProviderKind::MovieBox {
@@ -835,9 +822,25 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
         }
     }
 
-    text.push_str("\n<i>Tip: open the link in VLC / MX Player (Network stream) for best results.</i>");
-    rows.push(vec![cb("⬅ Other qualities", "q".to_string())]);
-    let markup = kb(rows);
+    let sid = random_id();
+    let page = format!("{}/p/{}", base.trim_end_matches('/'), sid);
+    let base_text = short_html(&text);
+    let locked_text = format!(
+        "{base_text}\n\n🔒 <b>Watch 2 short ads to unlock the Play button.</b>"
+    );
+    insert_stream(
+        &ctx.streams,
+        &sid,
+        Stream {
+            items,
+            title: format!("{}{}", title, episode_tag(&st)),
+            chat,
+            msg: 0,
+            text: base_text,
+            page: page.clone(),
+            unlocked_at: None,
+        },
+    );
 
     if let Some(w) = wait {
         let _ = ctx
@@ -845,10 +848,23 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
             .call("deleteMessage", &json!({"chat_id": chat, "message_id": w}))
             .await;
     }
-    let text = short_html(&text);
-    if ctx.tg.send(chat, &text, Some(markup)).await.is_err() {
-        let plain = json!({"inline_keyboard": [[cb("⬅ Other qualities", "q".to_string())]]});
-        let _ = ctx.tg.send(chat, &text, Some(plain)).await;
+    let back = vec![cb("⬅ Other qualities", "q".to_string())];
+    let with_webapp = kb(vec![
+        vec![json!({"text": "🔓 Watch 2 ads to unlock", "web_app": {"url": page.clone()}})],
+        back.clone(),
+    ]);
+    match ctx.tg.send(chat, &locked_text, Some(with_webapp)).await {
+        Ok(mid) => set_stream_msg(&ctx.streams, &sid, mid),
+        Err(_) => {
+            // Mini-App buttons only work in private chats; fall back to a link button.
+            let with_url = kb(vec![
+                vec![json!({"text": "🔓 Watch 2 ads to unlock", "url": page.clone()})],
+                back,
+            ]);
+            if let Ok(mid) = ctx.tg.send(chat, &locked_text, Some(with_url)).await {
+                set_stream_msg(&ctx.streams, &sid, mid);
+            }
+        }
     }
 }
 
@@ -1002,10 +1018,34 @@ async fn handle_update(ctx: Ctx, upd: Value) {
 // ----------------------------------------------- Built-in player/stream server
 
 #[derive(Clone)]
-struct Stream {
+struct StreamItem {
+    name: String,
     url: String,
     headers: Vec<(String, String)>,
+}
+
+#[derive(Clone)]
+struct Stream {
+    items: Vec<StreamItem>,
     title: String,
+    chat: i64,
+    msg: i64,
+    /// message text without the lock/unlock status line
+    text: String,
+    /// https://host/p/ID
+    page: String,
+    unlocked_at: Option<Instant>,
+}
+
+/// After watching the ads, playback stays unlocked for 6 hours.
+const UNLOCK_SECS: u64 = 6 * 3600;
+
+impl Stream {
+    fn is_unlocked(&self) -> bool {
+        self.unlocked_at
+            .map(|t| t.elapsed() < Duration::from_secs(UNLOCK_SECS))
+            .unwrap_or(false)
+    }
 }
 
 type StreamMap = Arc<Mutex<HashMap<String, Stream>>>;
@@ -1029,32 +1069,80 @@ fn random_id() -> String {
     out
 }
 
-fn register_stream(map: &StreamMap, st: Stream) -> String {
-    let id = random_id();
+fn insert_stream(map: &StreamMap, id: &str, st: Stream) {
     if let Ok(mut g) = map.lock() {
-        if g.len() > 2000 {
+        if g.len() > 5000 {
             g.clear();
         }
-        g.insert(id.clone(), st);
+        g.insert(id.to_string(), st);
     }
-    id
+}
+
+fn set_stream_msg(map: &StreamMap, id: &str, msg: i64) {
+    if let Ok(mut g) = map.lock() {
+        if let Some(st) = g.get_mut(id) {
+            st.msg = msg;
+        }
+    }
+}
+
+/// Play buttons that appear after the 2 ads were watched.
+fn play_keyboard(st: &Stream, webapp: bool) -> Value {
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+    for (i, it) in st.items.iter().enumerate() {
+        let page = format!("{}?n={}", st.page, i);
+        let label = format!("▶️ Play: {}", short(&it.name, 30));
+        if webapp {
+            rows.push(vec![json!({"text": label, "web_app": {"url": page.clone()}})]);
+        } else {
+            rows.push(vec![json!({"text": label, "url": page.clone()})]);
+        }
+        rows.push(vec![
+            json!({"text": "📱 MX Player", "url": format!("{page}&go=mx")}),
+            json!({"text": "🎞 VLC", "url": format!("{page}&go=vlc")}),
+        ]);
+    }
+    rows.push(vec![cb("⬅ Other qualities", "q".to_string())]);
+    kb(rows)
+}
+
+/// 6 hours after unlocking: remove the Play buttons and the stream.
+async fn expire_task(tg: Tg, streams: StreamMap, id: String, chat: i64, msg: i64, text: String) {
+    tokio::time::sleep(Duration::from_secs(UNLOCK_SECS)).await;
+    if let Ok(mut g) = streams.lock() {
+        g.remove(&id);
+    }
+    let t = format!(
+        "{text}\n\n⌛ <b>Expired.</b> Tap a quality again and watch 2 ads to play."
+    );
+    let _ = tg
+        .edit(chat, msg, &t, Some(kb(vec![vec![cb("⬅ Other qualities", "q".to_string())]])))
+        .await;
 }
 
 const PLAYER_HTML: &str = r##"<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>__TITLE__</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-body{margin:0;background:#0f0f14;color:#eee;font-family:system-ui,sans-serif}
+html,body{margin:0;background:#0f0f14;color:#eee;font-family:system-ui,sans-serif}
 h1{font-size:16px;margin:12px;font-weight:600}
-video{width:100%;max-height:70vh;background:#000}
+#wrap{position:relative;background:#000}
+video{display:block;width:100%;max-height:70vh;background:#000}
+#fs{position:absolute;top:8px;right:8px;z-index:5;border:0;border-radius:8px;background:rgba(0,0,0,.55);color:#fff;font-size:18px;padding:6px 10px}
 .row{display:flex;gap:8px;margin:12px}
 a.b{flex:1;text-align:center;padding:12px;border-radius:10px;background:#2b6cff;color:#fff;text-decoration:none;font-weight:600}
 a.v{background:#e8730c}
 p{margin:12px;font-size:13px;color:#aaa}
+body.fs h1,body.fs .row,body.fs p{display:none}
+body.fs #wrap{position:fixed;top:0;left:0;right:0;bottom:0;z-index:99;width:100vw;height:100vh}
+body.fs video{width:100vw;height:100vh;max-height:none;object-fit:contain}
 </style></head><body>
 <h1>__TITLE__</h1>
-<video id="v" controls autoplay playsinline src="/s/__ID__"></video>
+<div id="wrap">
+<video id="v" controls controlslist="nofullscreen" autoplay playsinline webkit-playsinline src="/s/__ID__?n=__N__"></video>
+<button id="fs" type="button">&#x26F6;</button>
+</div>
 <div class="row"><a class="b" id="mx" href="#">MX Player</a><a class="b v" id="vlc" href="#">VLC</a></div>
 <p id="msg">If the video does not start here (some formats are not supported by the in-app player), use MX Player or VLC.</p>
 <script>
@@ -1062,29 +1150,97 @@ var TITLE=__TITLE_JS__, GO="__GO__";
 var tg=window.Telegram&&window.Telegram.WebApp;
 if(tg){try{tg.ready();tg.expand();}catch(e){}}
 var inTg=!!(tg&&tg.initData);
-var abs=location.origin+"/s/__ID__";
+var abs=location.origin+"/s/__ID__?n=__N__";
 function intentFor(pkg){return "intent://"+abs.replace(/^https?:\/\//,"")+"#Intent;scheme=https;package="+pkg+";type=video/*;S.title="+encodeURIComponent(TITLE)+";end";}
 var PK={mx:"com.mxtech.videoplayer.ad",vlc:"org.videolan.vlc"};
 function launch(k){
-  if(inTg&&tg.openLink){tg.openLink(location.origin+"/p/__ID__?go="+k);return;}
+  if(inTg&&tg.openLink){tg.openLink(location.origin+"/p/__ID__?n=__N__&go="+k);return;}
   location.href=intentFor(PK[k]);
 }
 document.getElementById("mx").onclick=function(e){e.preventDefault();launch("mx");};
 document.getElementById("vlc").onclick=function(e){e.preventDefault();launch("vlc");};
 document.getElementById("v").addEventListener("error",function(){document.getElementById("msg").textContent="This video format cannot play in-app. Tap MX Player or VLC above.";});
+/* Fullscreen: Telegram's webview blocks the native button, so use our own. */
+var wrap=document.getElementById("wrap");
+function fsOn(){document.body.classList.add("fs");try{if(tg&&tg.requestFullscreen)tg.requestFullscreen();}catch(e){}}
+function fsOff(){document.body.classList.remove("fs");try{if(tg&&tg.exitFullscreen)tg.exitFullscreen();}catch(e){}try{if(document.fullscreenElement&&document.exitFullscreen)document.exitFullscreen();}catch(e){}}
+document.getElementById("fs").onclick=function(){
+  if(document.body.classList.contains("fs")){fsOff();return;}
+  if(inTg){fsOn();return;}
+  var r=wrap.requestFullscreen||wrap.webkitRequestFullscreen;
+  if(r){try{var pr=r.call(wrap);if(pr&&pr.catch){pr.catch(function(){fsOn();});}}catch(e){fsOn();}}else{fsOn();}
+};
+document.addEventListener("fullscreenchange",function(){if(!document.fullscreenElement){document.body.classList.remove("fs");}});
 if(GO&&PK[GO]&&!inTg){document.getElementById("v").pause();setTimeout(function(){location.href=intentFor(PK[GO]);},300);}
 </script></body></html>"##;
 
-fn player_page(id: &str, title: &str, go: &str) -> String {
-    let title_js = serde_json::to_string(title)
+const GATE_HTML: &str = r##"<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Unlock</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src='//libtl.com/sdk.js' data-zone='12229158' data-sdk='show_12229158'></script>
+<style>
+body{margin:0;background:#0f0f14;color:#eee;font-family:system-ui,sans-serif}
+h1{font-size:16px;margin:14px;font-weight:600}
+.card{margin:14px;padding:18px;border-radius:14px;background:#1b1b26;text-align:center}
+h2{margin:0 0 8px;font-size:18px}
+p{font-size:14px;color:#bbb}
+#prog{font-size:16px;margin:12px 0;font-weight:600}
+button{width:100%;padding:14px;border:0;border-radius:12px;background:#2b6cff;color:#fff;font-size:16px;font-weight:700}
+button:disabled{opacity:.6}
+#msg{min-height:20px;color:#ffb74d}
+</style></head><body>
+<h1>__TITLE__</h1>
+<div class="card">
+<h2>&#x1F512; Unlock playback</h2>
+<p>Watch 2 short ads to unlock the video. Playback stays unlocked for 6 hours.</p>
+<div id="prog">Ads watched: 0 / 2</div>
+<button id="btn" type="button">&#x25B6; Watch ad 1 of 2</button>
+<p id="msg"></p>
+</div>
+<script>
+var tg=window.Telegram&&window.Telegram.WebApp;
+if(tg){try{tg.ready();tg.expand();}catch(e){}}
+var done=0,busy=false;
+var btn=document.getElementById("btn"),prog=document.getElementById("prog"),msg=document.getElementById("msg");
+function adFn(){return (typeof show_12229158==="function")?show_12229158:null;}
+function unlock(){
+  msg.textContent="Unlocking...";
+  fetch("/unlock/__ID__",{method:"POST"}).then(function(r){
+    if(r.ok){location.reload();}else{msg.textContent="Could not unlock. Close this window and try again.";}
+  }).catch(function(){msg.textContent="Network error. Please reopen and try again.";});
+}
+btn.onclick=function(){
+  if(busy)return;
+  var f=adFn();
+  if(!f){msg.textContent="The ad could not load. Check your connection, disable any ad-blocker and try again.";return;}
+  busy=true;btn.disabled=true;msg.textContent="Loading ad...";
+  f().then(function(){
+    done++;prog.textContent="Ads watched: "+done+" / 2";busy=false;btn.disabled=false;msg.textContent="";
+    if(done>=2){btn.style.display="none";unlock();}
+    else{btn.textContent="\u25B6 Watch ad "+(done+1)+" of 2";}
+  }).catch(function(){busy=false;btn.disabled=false;msg.textContent="The ad was not completed. Please watch it fully.";});
+};
+</script></body></html>"##;
+
+fn js_str(s: &str) -> String {
+    serde_json::to_string(s)
         .unwrap_or_else(|_| "\"\"".to_string())
-        .replace("</", "<\\/");
+        .replace("</", "<\\/")
+}
+
+fn player_page(id: &str, title: &str, go: &str, n: usize) -> String {
     let go = if go == "mx" || go == "vlc" { go } else { "" };
     PLAYER_HTML
-        .replace("__TITLE_JS__", &title_js)
+        .replace("__TITLE_JS__", &js_str(title))
         .replace("__TITLE__", &esc(title))
         .replace("__ID__", id)
+        .replace("__N__", &n.to_string())
         .replace("__GO__", go)
+}
+
+fn gate_page(id: &str, title: &str) -> String {
+    GATE_HTML.replace("__TITLE__", &esc(title)).replace("__ID__", id)
 }
 
 async fn http_simple(
@@ -1104,7 +1260,12 @@ async fn http_simple(
     let _ = sock.flush().await;
 }
 
-async fn serve_conn(mut sock: tokio::net::TcpStream, streams: StreamMap, http: reqwest::Client) {
+async fn serve_conn(
+    mut sock: tokio::net::TcpStream,
+    streams: StreamMap,
+    http: reqwest::Client,
+    tg: Tg,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 2048];
@@ -1140,16 +1301,74 @@ async fn serve_conn(mut sock: tokio::net::TcpStream, streams: StreamMap, http: r
     let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
     let get = |id: &str| -> Option<Stream> { streams.lock().ok().and_then(|g| g.get(id).cloned()) };
 
+    let n: usize = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("n="))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    // Called by the gate page after both ads were watched.
+    if method == "POST" {
+        if let Some(id) = path.strip_prefix("/unlock/") {
+            let snapshot: Option<(Stream, bool)> = match streams.lock() {
+                Ok(mut g) => match g.get_mut(id) {
+                    Some(st) => {
+                        let newly = !st.is_unlocked();
+                        if newly {
+                            st.unlocked_at = Some(Instant::now());
+                        }
+                        Some((st.clone(), newly))
+                    }
+                    None => None,
+                },
+                Err(_) => None,
+            };
+            let Some((st, newly)) = snapshot else {
+                http_simple(&mut sock, 404, "Not Found", "text/plain", b"Expired").await;
+                return;
+            };
+            if newly && st.msg != 0 {
+                let text = format!(
+                    "{}\n\n✅ <b>Unlocked for 6 hours.</b> Tap Play below.",
+                    st.text
+                );
+                if tg
+                    .edit(st.chat, st.msg, &text, Some(play_keyboard(&st, true)))
+                    .await
+                    .is_err()
+                {
+                    let _ = tg
+                        .edit(st.chat, st.msg, &text, Some(play_keyboard(&st, false)))
+                        .await;
+                }
+                tokio::spawn(expire_task(
+                    tg.clone(),
+                    streams.clone(),
+                    id.to_string(),
+                    st.chat,
+                    st.msg,
+                    st.text.clone(),
+                ));
+            }
+            http_simple(&mut sock, 200, "OK", "application/json", b"{\"ok\":true}").await;
+            return;
+        }
+    }
+
     if let Some(id) = path.strip_prefix("/p/") {
         let Some(entry) = get(id) else {
-            http_simple(&mut sock, 404, "Not Found", "text/plain", b"Expired. Search again in the bot.").await;
+            http_simple(&mut sock, 404, "Not Found", "text/plain", b"Expired. Tap the quality again in the bot.").await;
             return;
         };
-        let go = query
-            .split('&')
-            .find_map(|kv| kv.strip_prefix("go="))
-            .unwrap_or("");
-        let html = player_page(id, &entry.title, go);
+        let html = if entry.is_unlocked() {
+            let go = query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("go="))
+                .unwrap_or("");
+            player_page(id, &entry.title, go, n)
+        } else {
+            gate_page(id, &entry.title)
+        };
         http_simple(&mut sock, 200, "OK", "text/html; charset=utf-8", html.as_bytes()).await;
         return;
     }
@@ -1159,9 +1378,17 @@ async fn serve_conn(mut sock: tokio::net::TcpStream, streams: StreamMap, http: r
             http_simple(&mut sock, 404, "Not Found", "text/plain", b"Expired").await;
             return;
         };
-        let mut req = http.get(&entry.url);
-        for (n, v) in &entry.headers {
-            req = req.header(n.as_str(), v.as_str());
+        if !entry.is_unlocked() {
+            http_simple(&mut sock, 403, "Forbidden", "text/plain", b"Locked: watch the ads first").await;
+            return;
+        }
+        let Some(item) = entry.items.get(n).cloned() else {
+            http_simple(&mut sock, 404, "Not Found", "text/plain", b"No such source").await;
+            return;
+        };
+        let mut req = http.get(&item.url);
+        for (hn, hv) in &item.headers {
+            req = req.header(hn.as_str(), hv.as_str());
         }
         if let Some(r) = &range {
             req = req.header("Range", r.as_str());
@@ -1217,7 +1444,7 @@ async fn serve_conn(mut sock: tokio::net::TcpStream, streams: StreamMap, http: r
     http_simple(&mut sock, 200, "OK", "text/plain", b"MovieBox bot player server").await;
 }
 
-async fn server_task(listener: tokio::net::TcpListener, streams: StreamMap) {
+async fn server_task(listener: tokio::net::TcpListener, streams: StreamMap, tg: Tg) {
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .user_agent("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36")
@@ -1226,7 +1453,7 @@ async fn server_task(listener: tokio::net::TcpListener, streams: StreamMap) {
     loop {
         match listener.accept().await {
             Ok((sock, _)) => {
-                tokio::spawn(serve_conn(sock, streams.clone(), http.clone()));
+                tokio::spawn(serve_conn(sock, streams.clone(), http.clone(), tg.clone()));
             }
             Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
         }
@@ -1412,7 +1639,7 @@ async fn main() {
     match tokio::net::TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => {
             let port = listener.local_addr().map(|a| a.port()).unwrap_or(8787);
-            tokio::spawn(server_task(listener, ctx.streams.clone()));
+            tokio::spawn(server_task(listener, ctx.streams.clone(), ctx.tg.clone()));
             tokio::spawn(tunnel_task(ctx.base.clone(), port));
         }
         Err(e) => eprintln!("player server failed to start: {e}"),
