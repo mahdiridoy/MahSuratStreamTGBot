@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.10.4",
+  "version": "2026.11.10.5",
   "description": "MovieBox Telegram bot (search all providers, play in Telegram / MX Player / VLC)",
   "homepage": "https://github.com/mahdiridoy/MahSuratStreamTGBot",
   "license": "MIT|Apache-2.0",
   "url": "https://github.com/mahdiridoy/MahSuratStreamTGBot/releases/download/bot-latest/MovieBoxBot_Windows_x64.zip",
-  "hash": "cb68e0378d20f3241676f1b992bae7d2cec15ffac54c3c6cbd431cbcc81f9f05",
+  "hash": "88ec3e51cd36ad33710a65e3ad3e3999820216248a7d9c1dba5827519c83ab49",
   "bin": "moviebox-tgbot.exe"
 }
