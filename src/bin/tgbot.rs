@@ -1040,7 +1040,7 @@ fn register_stream(map: &StreamMap, st: Stream) -> String {
     id
 }
 
-const PLAYER_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8">
+const PLAYER_HTML: &str = r##"<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__TITLE__</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
@@ -1073,7 +1073,7 @@ document.getElementById("mx").onclick=function(e){e.preventDefault();launch("mx"
 document.getElementById("vlc").onclick=function(e){e.preventDefault();launch("vlc");};
 document.getElementById("v").addEventListener("error",function(){document.getElementById("msg").textContent="This video format cannot play in-app. Tap MX Player or VLC above.";});
 if(GO&&PK[GO]&&!inTg){document.getElementById("v").pause();setTimeout(function(){location.href=intentFor(PK[GO]);},300);}
-</script></body></html>"#;
+</script></body></html>"##;
 
 fn player_page(id: &str, title: &str, go: &str) -> String {
     let title_js = serde_json::to_string(title)
