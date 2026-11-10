@@ -1,0 +1,64 @@
+name: Transfer MovieBox Project to Root
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Verify Source Folder
+        run: |
+          if [ ! -d "MovieBox-Tui-main" ]; then
+            echo "ERROR: MovieBox-Tui-main folder not found!"
+            exit 1
+          fi
+
+          if [ -z "$(find MovieBox-Tui-main -mindepth 1 -print -quit)" ]; then
+            echo "ERROR: Source folder is empty!"
+            exit 1
+          fi
+
+      - name: Transfer All Files to Repository Root
+        run: |
+          echo "Transferring project files..."
+
+          cp -a MovieBox-Tui-main/. .
+
+          echo "Transfer completed."
+
+      - name: Remove Original Source Folder
+        run: |
+          rm -rf MovieBox-Tui-main
+
+      - name: Commit and Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes detected."
+          else
+            git commit -m "chore: move MovieBox project to repository root"
+            git push origin HEAD:${GITHUB_REF_NAME}
+          fi
+
+      - name: Transfer Summary
+        run: |
+          echo "================================"
+          echo "MovieBox Project Transfer Done"
+          echo "================================"
+          echo "All source files moved to root."
+          echo "Original folder removed."
+          
