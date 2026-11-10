@@ -1,0 +1,49 @@
+name: Telegram Bot
+
+on:
+  workflow_dispatch:
+  # auto-update: any new commit restarts the bot with the new code
+  push:
+    branches: [main, master]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/telegram-bot.yml"
+  schedule:
+    # restart every 6 hours (each run lives ~5h50m)
+    - cron: "5 */6 * * *"
+
+permissions:
+  contents: read
+
+# Only one bot at a time; a newer run (update/restart) replaces the old one.
+concurrency:
+  group: telegram-bot
+  cancel-in-progress: true
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.90.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "tgbot"
+      - name: Install cloudflared (free tunnel for the built-in player)
+        run: |
+          curl -fsSL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+      - name: Build bot
+        run: cargo build --profile bot --bin tgbot
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ALLOWED_CHAT_IDS: ${{ vars.ALLOWED_CHAT_IDS }}
+          CLOUDFLARED_BIN: ./cloudflared
+          RUN_MINUTES: "345"
+        run: ./target/bot/tgbot
