@@ -47,7 +47,7 @@ jobs:
             os: windows-latest
             kind: native
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.90.0
@@ -105,7 +105,7 @@ jobs:
           Copy-Item "target\${{ matrix.target }}\bot\tgbot.exe" "dist\moviebox-tgbot.exe"
           Compress-Archive -Path dist\* -DestinationPath MovieBoxBot_${{ matrix.name }}.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bot-${{ matrix.name }}
           path: |
@@ -117,10 +117,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
