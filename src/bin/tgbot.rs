@@ -1,7 +1,7 @@
 //! Telegram bot front-end for the MovieBox-TUI provider library.
 //!
-//! Flow: search all providers -> pick provider -> pick title -> (season/episode)
-//! -> pick audio -> pick quality/source -> receive stream/download links.
+//! Flow: search all providers -> one combined result list -> pick title -> (season/episode)
+//! -> All audio languages -> pick quality/source (all providers merged) -> play / download.
 //!
 //! Runs with long polling (no server needed), so it works inside GitHub Actions.
 //!
@@ -16,14 +16,14 @@ use std::time::{Duration, Instant};
 
 use moviebox_tui::providers::ReleaseProvider;
 use moviebox_tui::providers::models::{
-    CatalogItem, MediaDetails, ProviderError, ProviderKind, Release, ResolutionIntent,
+    CatalogItem, MediaDetails, MediaType, ProviderError, ProviderKind, Release, ResolutionIntent,
 };
 use moviebox_tui::service::MovieBoxService;
 use serde_json::{Value, json};
 
-const PAGE_ITEMS: usize = 8;
+const PAGE_ITEMS: usize = 10;
 const PAGE_EPISODES: usize = 30;
-const MAX_QUALITY_BUTTONS: usize = 40;
+const MAX_QUALITY_BUTTONS: usize = 90;
 
 // ---------------------------------------------------------------- Telegram
 
@@ -119,15 +119,28 @@ impl Tg {
 #[derive(Default, Clone)]
 struct ChatState {
     query: String,
-    results: Vec<(ProviderKind, Vec<CatalogItem>, Option<String>)>,
-    provider: ProviderKind,
-    details: Option<MediaDetails>,
-    subject_id: String,
-    dub_chosen: bool,
+    /// Titles merged from all providers (same name + release year)
+    groups: Vec<Group>,
+    /// Details of the chosen title from every provider that has it
+    members: Vec<(ProviderKind, MediaDetails)>,
+    /// Details used for the card and the season / episode lists
+    primary: Option<MediaDetails>,
+    /// "Name (Year)" of the chosen title
+    title: String,
     season: usize,
     episode: usize,
+    targets: Vec<Target>,
     releases: Vec<Release>,
-    lang: Option<String>,
+    /// For every release: index into `targets`
+    rel_target: Vec<usize>,
+}
+
+/// One provider subject the streams were fetched from.
+#[derive(Clone)]
+struct Target {
+    provider: ProviderKind,
+    subject_id: String,
+    siblings: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -157,7 +170,9 @@ fn st_set<F: FnOnce(&mut ChatState)>(ctx: &Ctx, chat: i64, f: F) {
 // ---------------------------------------------------------------- Helpers
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn short(s: &str, n: usize) -> String {
@@ -227,9 +242,9 @@ async fn show(ctx: &Ctx, chat: i64, msg: Option<i64>, text: &str, markup: Option
 
 const HELP: &str = "<b>MahSurat Stream Bot</b>\n\n\
 Send a movie or series name (or use /search name).\n\
-I search <b>all providers</b>, then you pick:\n\
-1. Provider\n2. Title\n3. Season / Episode (series)\n4. Audio language\n5. Quality / source\n\n\
-You get direct stream/download links + subtitles when available.\n\n\
+I search <b>all providers</b> at once and show one combined list:\n\
+1. Pick the title (name + year)\n2. Season / Episode (series)\n3. All audio languages\n4. Pick a quality / source (links from every provider)\n\n\
+Then play it in Telegram, MX Player or VLC, or tap ⬇️ Download.\n\n\
 /search &lt;name&gt; - search all providers\n/id - show your chat id";
 
 // ----------------------------------------------------------------- Search
@@ -244,10 +259,155 @@ const BOT_PROVIDERS: [ProviderKind; 6] = [
     ProviderKind::Addons,
 ];
 
+/// Order used to pick the provider whose metadata (poster, description,
+/// seasons) is shown on the title card.
+const DETAIL_PRIORITY: [ProviderKind; 6] = [
+    ProviderKind::Addons,
+    ProviderKind::MovieBox,
+    ProviderKind::FourKHdHub,
+    ProviderKind::Dramachi,
+    ProviderKind::BdixCircleFtp,
+    ProviderKind::BdixDhakaFlix,
+];
+
+/// One title (same name + release year) found on one or more providers.
+#[derive(Clone)]
+struct Group {
+    title: String,
+    year: String,
+    series: bool,
+    poster: Option<String>,
+    members: Vec<(ProviderKind, CatalogItem)>,
+}
+
+/// Lower-case title without bracketed text, punctuation or a leading "the".
+fn norm_title(s: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0u32;
+    for c in s.chars() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            '&' => out.push_str(" and "),
+            c if c.is_alphanumeric() => out.extend(c.to_lowercase()),
+            _ => out.push(' '),
+        }
+    }
+    let joined = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    match joined.strip_prefix("the ") {
+        Some(rest) => rest.to_string(),
+        None => joined,
+    }
+}
+
+/// Title for display: original case, bracketed text removed.
+fn clean_title(s: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0u32;
+    for c in s.chars() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            _ => out.push(c),
+        }
+    }
+    let t = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.is_empty() {
+        s.trim().to_string()
+    } else {
+        t
+    }
+}
+
+/// First 4-digit year (19xx / 20xx) found in the text, or "".
+fn year_of(y: Option<&str>) -> String {
+    let Some(y) = y else {
+        return String::new();
+    };
+    let chars: Vec<char> = y.chars().collect();
+    for w in chars.windows(4) {
+        let digits = w.iter().all(|c| c.is_ascii_digit());
+        let century = (w[0] == '1' && w[1] == '9') || (w[0] == '2' && w[1] == '0');
+        if digits && century {
+            return w.iter().collect();
+        }
+    }
+    String::new()
+}
+
+fn distinct_providers(members: &[(ProviderKind, CatalogItem)]) -> usize {
+    let mut seen: Vec<ProviderKind> = Vec::new();
+    for (p, _) in members {
+        if !seen.contains(p) {
+            seen.push(*p);
+        }
+    }
+    seen.len()
+}
+
+/// Merge the results of all providers: same name + same release year = one title.
+fn build_groups(results: &[(ProviderKind, Vec<CatalogItem>)]) -> Vec<Group> {
+    let mut groups: Vec<Group> = Vec::new();
+    let mut keys: Vec<(String, String)> = Vec::new();
+    // First the items that have a year, then the ones without (they join any
+    // title with the same name).
+    for with_year in [true, false] {
+        for (p, items) in results {
+            for it in items {
+                let nt = norm_title(&it.title);
+                let y = year_of(it.year.as_deref());
+                if nt.is_empty() || y.is_empty() == with_year {
+                    continue;
+                }
+                let series = it.media_type == MediaType::Series;
+                let poster = it.poster_url.clone().filter(|u| u.starts_with("http"));
+                let pos = keys
+                    .iter()
+                    .position(|(kt, ky)| *kt == nt && (y.is_empty() || *ky == y));
+                match pos {
+                    Some(i) => {
+                        let g = &mut groups[i];
+                        let dup = g
+                            .members
+                            .iter()
+                            .any(|(mp, mi)| mp == p && mi.id.value == it.id.value);
+                        if g.members.len() < 12 && !dup {
+                            g.members.push((*p, it.clone()));
+                        }
+                        g.series |= series;
+                        if g.poster.is_none() {
+                            g.poster = poster;
+                        }
+                    }
+                    None => {
+                        keys.push((nt, y.clone()));
+                        groups.push(Group {
+                            title: clean_title(&it.title),
+                            year: y,
+                            series,
+                            poster,
+                            members: vec![(*p, it.clone())],
+                        });
+                    }
+                }
+            }
+        }
+    }
+    // Titles that exist on more providers come first.
+    groups.sort_by_key(|g| std::cmp::Reverse(distinct_providers(&g.members)));
+    groups
+}
+
 async fn do_search(ctx: &Ctx, chat: i64, query: &str) {
     let wait = ctx
         .tg
-        .send(chat, &format!("🔎 Searching all providers for <b>{}</b>…", esc(query)), None)
+        .send(
+            chat,
+            &format!("🔎 Searching all providers for <b>{}</b>…", esc(query)),
+            None,
+        )
         .await
         .ok();
 
@@ -261,100 +421,67 @@ async fn do_search(ctx: &Ctx, chat: i64, query: &str) {
     });
     let outs = futures::future::join_all(futs).await;
 
-    let mut results = Vec::new();
+    let mut results: Vec<(ProviderKind, Vec<CatalogItem>)> = Vec::new();
     for (p, r) in outs {
-        let (items, err) = match r {
-            Ok(Ok(v)) => (v, None),
-            Ok(Err(ProviderError::NotFound)) => (Vec::new(), None),
-            Ok(Err(e)) => (Vec::new(), Some(e.user_message(p))),
-            Err(_) => (Vec::new(), Some(format!("{} timed out.", p.label()))),
-        };
-        results.push((p, items, err));
+        if let Ok(Ok(items)) = r {
+            if !items.is_empty() {
+                results.push((p, items));
+            }
+        }
     }
+    let groups = build_groups(&results);
     let q = query.to_string();
     st_set(ctx, chat, |s| {
         *s = ChatState::default();
         s.query = q;
-        s.results = results;
+        s.groups = groups;
     });
-    show_providers(ctx, chat, wait).await;
+    show_results(ctx, chat, wait, 0).await;
 }
 
-async fn show_providers(ctx: &Ctx, chat: i64, msg: Option<i64>) {
+/// One combined list ("Total results") with every title from every provider.
+async fn show_results(ctx: &Ctx, chat: i64, msg: Option<i64>, page: usize) {
     let st = st_get(ctx, chat);
-    let mut text = format!("Results for <b>{}</b>:\n", esc(&st.query));
-    let mut rows: Vec<Vec<Value>> = Vec::new();
-    let mut any = false;
-    for (i, (p, items, err)) in st.results.iter().enumerate() {
-        if p.is_bdix() && items.is_empty() {
-            continue; // never show BDIX warnings
-        }
-        if !items.is_empty() {
-            any = true;
-            text.push_str(&format!("\n✅ {}: {} result(s)", p.label(), items.len()));
-            rows.push(vec![cb(
-                &format!("{} ({})", p.label(), items.len()),
-                format!("p:{i}:0"),
-            )]);
-        } else if let Some(e) = err {
-            text.push_str(&format!("\n⚠️ {}: {}", p.label(), esc(e)));
-        } else {
-            text.push_str(&format!("\n▫️ {}: nothing found", p.label()));
-        }
-    }
-    if any {
-        text.push_str("\n\nChoose a provider:");
-    } else {
-        text.push_str("\n\nNo results. Try another name.");
-    }
-    let markup = if rows.is_empty() { None } else { Some(kb(rows)) };
-    show(ctx, chat, msg, &text, markup).await;
-}
-
-async fn show_items(ctx: &Ctx, chat: i64, msg: Option<i64>, pi: usize, page: usize) {
-    let st = st_get(ctx, chat);
-    let Some((p, items, _)) = st.results.get(pi) else {
-        expired(ctx, chat).await;
+    let total = st.groups.len();
+    if total == 0 {
+        let text = format!(
+            "No results for <b>{}</b>. Try another name.",
+            esc(&st.query)
+        );
+        show(ctx, chat, msg, &text, None).await;
         return;
-    };
-    let total = items.len();
+    }
     let start = (page * PAGE_ITEMS).min(total);
     let end = (start + PAGE_ITEMS).min(total);
     let mut rows: Vec<Vec<Value>> = Vec::new();
-    for (j, it) in items.iter().enumerate().take(end).skip(start) {
-        let icon = if it.media_type == moviebox_tui::providers::models::MediaType::Series {
-            "📺"
+    for (gi, g) in st.groups.iter().enumerate().take(end).skip(start) {
+        let icon = if g.series { "📺" } else { "🎬" };
+        let year = if g.year.is_empty() {
+            String::new()
         } else {
-            "🎬"
+            format!(" ({})", g.year)
         };
-        let year = it
-            .year
-            .as_ref()
-            .filter(|y| !y.is_empty())
-            .map(|y| format!(" ({y})"))
-            .unwrap_or_default();
         rows.push(vec![cb(
-            &short(&format!("{icon} {}{year}", it.title), 56),
-            format!("d:{pi}:{j}"),
+            &short(&format!("{icon} {}{year}", g.title), 56),
+            format!("d:{gi}"),
         )]);
     }
     let mut nav = Vec::new();
     if page > 0 {
-        nav.push(cb("◀ Prev", format!("p:{pi}:{}", page - 1)));
+        nav.push(cb("◀ Prev", format!("g:{}", page - 1)));
     }
     if end < total {
-        nav.push(cb("Next ▶", format!("p:{pi}:{}", page + 1)));
+        nav.push(cb("Next ▶", format!("g:{}", page + 1)));
     }
     if !nav.is_empty() {
         rows.push(nav);
     }
-    rows.push(vec![cb("⬅ Providers", "pv".to_string())]);
     let text = format!(
-        "<b>{}</b> — {}-{} of {}\nPick a title:",
-        esc(p.label()),
+        "Results for <b>{}</b>\n\n✅ Total results: {}\nShowing {}-{}\n\nPick a title:",
+        esc(&st.query),
+        total,
         start + 1,
-        end,
-        total
+        end
     );
     show(ctx, chat, msg, &text, Some(kb(rows))).await;
 }
@@ -368,15 +495,16 @@ async fn expired(ctx: &Ctx, chat: i64) {
 
 // ---------------------------------------------------------------- Details
 
-fn card(d: &MediaDetails, provider: ProviderKind) -> String {
+fn card(d: &MediaDetails, providers: usize) -> String {
     let mut s = format!("<b>{}</b>", esc(&d.title));
     if let Some(y) = d.year.as_ref().filter(|y| !y.is_empty()) {
         s.push_str(&format!(" ({})", esc(y)));
     }
     s.push_str(&format!(
-        "\n{} • {}",
+        "\n{} • {} provider{}",
         if d.is_series() { "Series" } else { "Movie" },
-        esc(provider.label())
+        providers,
+        if providers == 1 { "" } else { "s" }
     ));
     if let Some(r) = d.imdb_rating.as_ref().filter(|r| !r.is_empty()) {
         s.push_str(&format!(" • ⭐ {}", esc(r)));
@@ -386,9 +514,6 @@ fn card(d: &MediaDetails, provider: ProviderKind) -> String {
     }
     if !d.genres.is_empty() {
         s.push_str(&format!("\n{}", esc(&d.genres.join(", "))));
-    }
-    if let Some(a) = d.audios.as_ref().filter(|a| !a.is_empty()) {
-        s.push_str(&format!("\n🔊 {}", esc(&short(a, 120))));
     }
     if let Some(a) = d.stars.as_ref().filter(|a| !a.is_empty()) {
         s.push_str(&format!("\n👥 {}", esc(&short(a, 120))));
@@ -403,52 +528,110 @@ fn card(d: &MediaDetails, provider: ProviderKind) -> String {
     s
 }
 
-async fn open_item(ctx: &Ctx, chat: i64, pi: usize, j: usize) {
+/// A title was picked: load its details from every provider that has it.
+async fn open_group(ctx: &Ctx, chat: i64, gi: usize) {
     let st = st_get(ctx, chat);
-    let Some((p, items, _)) = st.results.get(pi) else {
+    let Some(group) = st.groups.get(gi).cloned() else {
         expired(ctx, chat).await;
         return;
     };
-    let Some(item) = items.get(j).cloned() else {
+    let wait = ctx
+        .tg
+        .send(chat, "⏳ Loading details from all providers…", None)
+        .await
+        .ok();
+
+    let futs = group.members.iter().map(|(p, item)| {
+        let svc = ctx.svc.clone();
+        let p = *p;
+        let id = item.id.value.clone();
+        async move {
+            let r = tokio::time::timeout(Duration::from_secs(30), svc.details_typed(p, &id)).await;
+            (p, r)
+        }
+    });
+    let outs = futures::future::join_all(futs).await;
+
+    let mut members: Vec<(ProviderKind, MediaDetails)> = Vec::new();
+    let mut first_err: Option<String> = None;
+    for (p, r) in outs {
+        match r {
+            Ok(Ok(d)) => members.push((p, d)),
+            Ok(Err(e)) => {
+                if first_err.is_none() {
+                    first_err = Some(e.user_message(p));
+                }
+            }
+            Err(_) => {
+                if first_err.is_none() {
+                    first_err = Some(format!("{} timed out loading details.", p.label()));
+                }
+            }
+        }
+    }
+    if members.is_empty() {
+        let msg = first_err.unwrap_or_else(|| "Could not load details.".to_string());
+        show(ctx, chat, wait, &format!("⚠️ {}", esc(&msg)), None).await;
+        return;
+    }
+    members.sort_by_key(|(p, _)| {
+        DETAIL_PRIORITY
+            .iter()
+            .position(|x| x == p)
+            .unwrap_or(usize::MAX)
+    });
+
+    // Metadata / seasons come from the best provider that has them.
+    let with_seasons = members.iter().find(|(_, d)| !d.seasons.is_empty());
+    let chosen = if group.series {
+        with_seasons.or(members.first())
+    } else {
+        members.first()
+    };
+    let Some(primary) = chosen.map(|(_, d)| d.clone()) else {
         expired(ctx, chat).await;
         return;
     };
-    let p = *p;
-    let wait = ctx.tg.send(chat, "⏳ Loading details…", None).await.ok();
 
-    let res = tokio::time::timeout(
-        Duration::from_secs(30),
-        ctx.svc.details_typed(p, &item.id.value),
-    )
-    .await;
-    let details = match res {
-        Ok(Ok(d)) => d,
-        Ok(Err(e)) => {
-            show(ctx, chat, wait, &format!("⚠️ {}", esc(&e.user_message(p))), None).await;
-            return;
+    let mut seen: Vec<ProviderKind> = Vec::new();
+    for (p, _) in &members {
+        if !seen.contains(p) {
+            seen.push(*p);
         }
-        Err(_) => {
-            show(ctx, chat, wait, "⚠️ Timed out loading details.", None).await;
-            return;
-        }
-    };
-
-    let caption = card(&details, p);
-    let poster = details
+    }
+    let caption = card(&primary, seen.len());
+    let ok_url = |u: &String| u.starts_with("http");
+    let poster = primary
         .poster_url
         .clone()
-        .or(item.poster_url.clone())
-        .filter(|u| u.starts_with("http"));
-    let d2 = details.clone();
+        .filter(ok_url)
+        .or_else(|| {
+            members
+                .iter()
+                .find_map(|(_, d)| d.poster_url.clone().filter(ok_url))
+        })
+        .or_else(|| group.poster.clone());
+
+    let year = if group.year.is_empty() {
+        year_of(primary.year.as_deref())
+    } else {
+        group.year.clone()
+    };
+    let title = if year.is_empty() {
+        group.title.clone()
+    } else {
+        format!("{} ({})", group.title, year)
+    };
+    let p2 = primary.clone();
     st_set(ctx, chat, |s| {
-        s.provider = p;
-        s.subject_id = d2.id.value.clone();
-        s.details = Some(d2);
-        s.dub_chosen = false;
+        s.members = members;
+        s.primary = Some(p2);
+        s.title = title;
         s.season = 0;
         s.episode = 0;
+        s.targets.clear();
         s.releases.clear();
-        s.lang = None;
+        s.rel_target.clear();
     });
 
     let mut sent_photo = false;
@@ -459,26 +642,32 @@ async fn open_item(ctx: &Ctx, chat: i64, pi: usize, j: usize) {
         let _ = ctx.tg.send(chat, &caption, None).await;
     }
     if let Some(w) = wait {
-        let _ = ctx.tg.call("deleteMessage", &json!({"chat_id": chat, "message_id": w})).await;
+        let _ = ctx
+            .tg
+            .call("deleteMessage", &json!({"chat_id": chat, "message_id": w}))
+            .await;
     }
 
-    if details.is_series() && !details.seasons.is_empty() {
+    if primary.is_series() && !primary.seasons.is_empty() {
         show_seasons(ctx, chat, None).await;
     } else {
-        proceed(ctx, chat, None).await;
+        show_audio(ctx, chat, None).await;
     }
 }
 
 async fn show_seasons(ctx: &Ctx, chat: i64, msg: Option<i64>) {
     let st = st_get(ctx, chat);
-    let Some(d) = st.details.as_ref() else {
+    let Some(d) = st.primary.as_ref() else {
         expired(ctx, chat).await;
         return;
     };
     let mut rows: Vec<Vec<Value>> = Vec::new();
     let mut row: Vec<Value> = Vec::new();
     for s in d.seasons.iter().take(40) {
-        row.push(cb(&format!("Season {}", s.number), format!("s:{}:0", s.number)));
+        row.push(cb(
+            &format!("Season {}", s.number),
+            format!("s:{}:0", s.number),
+        ));
         if row.len() == 4 {
             rows.push(std::mem::take(&mut row));
         }
@@ -491,7 +680,7 @@ async fn show_seasons(ctx: &Ctx, chat: i64, msg: Option<i64>) {
 
 async fn show_episodes(ctx: &Ctx, chat: i64, msg: Option<i64>, season: usize, page: usize) {
     let st = st_get(ctx, chat);
-    let Some(d) = st.details.as_ref() else {
+    let Some(d) = st.primary.as_ref() else {
         expired(ctx, chat).await;
         return;
     };
@@ -533,28 +722,10 @@ async fn show_episodes(ctx: &Ctx, chat: i64, msg: Option<i64>, season: usize, pa
 
 // ------------------------------------------------- Audio / streams / quality
 
-/// After the title (movie) or episode is chosen: ask for audio dub if the
-/// provider exposes several, otherwise go straight to fetching streams.
-async fn proceed(ctx: &Ctx, chat: i64, msg: Option<i64>) {
-    let st = st_get(ctx, chat);
-    let Some(d) = st.details.as_ref() else {
-        expired(ctx, chat).await;
-        return;
-    };
-    if d.has_languages() && !st.dub_chosen {
-        let mut rows: Vec<Vec<Value>> = Vec::new();
-        for (k, dub) in d.dubs.iter().enumerate().take(40) {
-            let name = if dub.label.trim().is_empty() {
-                dub.language.clone()
-            } else {
-                dub.label.clone()
-            };
-            rows.push(vec![cb(&format!("🔊 {}", short(&name, 40)), format!("a:{k}"))]);
-        }
-        show(ctx, chat, msg, "Choose the audio / dub:", Some(kb(rows))).await;
-        return;
-    }
-    fetch_releases(ctx, chat, msg).await;
+/// The only audio choice: everything from every provider.
+async fn show_audio(ctx: &Ctx, chat: i64, msg: Option<i64>) {
+    let rows = vec![vec![cb("🔊 All audio languages", "al".to_string())]];
+    show(ctx, chat, msg, "Choose the audio language:", Some(kb(rows))).await;
 }
 
 async fn provider_streams(
@@ -570,7 +741,9 @@ async fn provider_streams(
         }
         ProviderKind::FourKHdHub => match svc.fourk_client.as_ref() {
             Some(c) => ReleaseProvider::episode_streams(c, id, season, episode).await,
-            None => Err(ProviderError::Unavailable("4KHDHub is unavailable".to_string())),
+            None => Err(ProviderError::Unavailable(
+                "4KHDHub is unavailable".to_string(),
+            )),
         },
         ProviderKind::Dramachi => {
             ReleaseProvider::episode_streams(&svc.dramachi_client, id, season, episode).await
@@ -587,138 +760,118 @@ async fn provider_streams(
     }
 }
 
-async fn fetch_releases(ctx: &Ctx, chat: i64, msg: Option<i64>) {
+/// Fetch the streams of this title from every provider at the same time and
+/// merge them into one list.
+async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
     let st = st_get(ctx, chat);
-    let target = match msg {
+    let target_msg = match msg {
         Some(m) => {
-            let _ = ctx.tg.edit(chat, m, "⏳ Fetching streams…", None).await;
+            let _ = ctx
+                .tg
+                .edit(chat, m, "⏳ Fetching streams from all providers…", None)
+                .await;
             Some(m)
         }
-        None => ctx.tg.send(chat, "⏳ Fetching streams…", None).await.ok(),
+        None => ctx
+            .tg
+            .send(chat, "⏳ Fetching streams from all providers…", None)
+            .await
+            .ok(),
     };
-    let p = st.provider;
-    let res = tokio::time::timeout(
-        Duration::from_secs(45),
-        provider_streams(&ctx.svc, p, &st.subject_id, st.season, st.episode),
-    )
-    .await;
-    let mut releases = match res {
-        Ok(Ok(r)) if !r.is_empty() => r,
-        Ok(Ok(_)) => {
-            show(ctx, chat, target, "⚠️ No streams found for this item.", None).await;
-            return;
+
+    // One target per provider subject (MovieBox has one subject per audio dub).
+    let mut targets: Vec<Target> = Vec::new();
+    for (p, d) in &st.members {
+        let mut ids: Vec<String> = Vec::new();
+        if *p == ProviderKind::MovieBox {
+            ids.extend(d.dubs.iter().map(|x| x.subject_id.clone()));
         }
-        Ok(Err(e)) => {
-            show(ctx, chat, target, &format!("⚠️ {}", esc(&e.user_message(p))), None).await;
-            return;
+        ids.push(d.id.value.clone());
+        let siblings = d.sibling_ids();
+        for id in ids {
+            if id.is_empty()
+                || targets
+                    .iter()
+                    .any(|t| t.provider == *p && t.subject_id == id)
+            {
+                continue;
+            }
+            targets.push(Target {
+                provider: *p,
+                subject_id: id,
+                siblings: siblings.clone(),
+            });
         }
-        Err(_) => {
-            show(ctx, chat, target, "⚠️ Timed out fetching streams.", None).await;
-            return;
+    }
+
+    let futs = targets.iter().enumerate().map(|(ti, t)| {
+        let svc = ctx.svc.clone();
+        let p = t.provider;
+        let id = t.subject_id.clone();
+        let (season, episode) = (st.season, st.episode);
+        async move {
+            let r = tokio::time::timeout(
+                Duration::from_secs(45),
+                provider_streams(&svc, p, &id, season, episode),
+            )
+            .await;
+            (ti, p, r)
         }
-    };
-    releases.sort_by(|a, b| {
-        b.resolution_u64()
-            .cmp(&a.resolution_u64())
-            .then_with(|| b.size_bytes.cmp(&a.size_bytes))
     });
+    let outs = futures::future::join_all(futs).await;
+
+    let mut tagged: Vec<(Release, usize)> = Vec::new();
+    let mut errs: Vec<String> = Vec::new();
+    for (ti, p, r) in outs {
+        match r {
+            Ok(Ok(v)) => tagged.extend(v.into_iter().map(|x| (x, ti))),
+            Ok(Err(ProviderError::NotFound)) => {}
+            Ok(Err(e)) => errs.push(e.user_message(p)),
+            Err(_) => errs.push(format!("{} timed out.", p.label())),
+        }
+    }
+    if tagged.is_empty() {
+        let mut text = "⚠️ No streams found for this item.".to_string();
+        errs.dedup();
+        for e in errs.iter().take(3) {
+            text.push_str(&format!("\n• {}", esc(&short(e, 120))));
+        }
+        show(ctx, chat, target_msg, &text, None).await;
+        return;
+    }
+    tagged.sort_by(|a, b| {
+        b.0.resolution_u64()
+            .cmp(&a.0.resolution_u64())
+            .then_with(|| b.0.size_bytes.cmp(&a.0.size_bytes))
+    });
+    let (releases, rel_target): (Vec<Release>, Vec<usize>) = tagged.into_iter().unzip();
     st_set(ctx, chat, |s| {
+        s.targets = targets;
         s.releases = releases;
-        s.lang = None;
+        s.rel_target = rel_target;
     });
-    after_releases(ctx, chat, target).await;
-}
-
-fn languages(releases: &[Release]) -> Vec<String> {
-    let mut langs: Vec<String> = releases
-        .iter()
-        .filter_map(|r| r.language.clone())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    langs.sort_by_key(|s| s.to_lowercase());
-    langs.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-    langs
-}
-
-async fn after_releases(ctx: &Ctx, chat: i64, msg: Option<i64>) {
-    let st = st_get(ctx, chat);
-    if languages(&st.releases).len() > 1 {
-        show_languages(ctx, chat, msg).await;
-    } else {
-        show_qualities(ctx, chat, msg).await;
-    }
-}
-
-async fn show_languages(ctx: &Ctx, chat: i64, msg: Option<i64>) {
-    let st = st_get(ctx, chat);
-    let langs = languages(&st.releases);
-    let mut rows: Vec<Vec<Value>> = Vec::new();
-    for (k, l) in langs.iter().enumerate().take(40) {
-        let n = st
-            .releases
-            .iter()
-            .filter(|r| {
-                r.language
-                    .as_deref()
-                    .is_some_and(|x| x.trim().eq_ignore_ascii_case(l))
-            })
-            .count();
-        rows.push(vec![cb(
-            &format!("🔊 {} ({n})", short(l, 36)),
-            format!("l:{k}"),
-        )]);
-    }
-    rows.push(vec![cb("All audio languages", "l:x".to_string())]);
-    show(ctx, chat, msg, "Choose the audio language:", Some(kb(rows))).await;
+    show_qualities(ctx, chat, target_msg).await;
 }
 
 async fn show_qualities(ctx: &Ctx, chat: i64, msg: Option<i64>) {
     let st = st_get(ctx, chat);
-    let mut idx: Vec<usize> = st
-        .releases
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| match &st.lang {
-            None => true,
-            Some(l) => r
-                .language
-                .as_deref()
-                .is_some_and(|x| x.trim().eq_ignore_ascii_case(l)),
-        })
-        .map(|(i, _)| i)
-        .collect();
-    if idx.is_empty() {
-        idx = (0..st.releases.len()).collect();
-    }
     let mut rows: Vec<Vec<Value>> = Vec::new();
-    for i in idx.iter().take(MAX_QUALITY_BUTTONS) {
-        rows.push(vec![cb(&rel_label(&st.releases[*i]), format!("r:{i}"))]);
+    for (i, r) in st.releases.iter().enumerate().take(MAX_QUALITY_BUTTONS) {
+        rows.push(vec![cb(&rel_label(r), format!("r:{i}"))]);
     }
-    if languages(&st.releases).len() > 1 {
-        rows.push(vec![cb("🔊 Change audio", "lm".to_string())]);
-    }
-    let title = st
-        .details
-        .as_ref()
-        .map(|d| d.title.clone())
-        .unwrap_or_default();
-    let lang = st
-        .lang
-        .as_ref()
-        .map(|l| format!(" • {}", esc(l)))
-        .unwrap_or_default();
     let text = format!(
-        "<b>{}</b>{}{}\nChoose quality / source ({} available):",
-        esc(&title),
+        "<b>{}</b>{}\nChoose quality / source ({} available):",
+        esc(&st.title),
         esc(&episode_tag(&st)),
-        lang,
-        idx.len()
+        st.releases.len()
     );
     show(ctx, chat, msg, &text, Some(kb(rows))).await;
 }
 
 // ------------------------------------------------------------------ Links
+
+/// (label, url, headers)
+type LinkEntry = (String, String, Vec<(String, String)>);
 
 async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
     let st = st_get(ctx, chat);
@@ -729,7 +882,7 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
     let wait = ctx.tg.send(chat, "⏳ Getting links…", None).await.ok();
 
     // (label, url, headers)
-    let mut links: Vec<(String, String, Vec<(String, String)>)> = Vec::new();
+    let mut links: Vec<LinkEntry> = Vec::new();
     let mut problem: Option<String> = None;
 
     if rel.provider == ProviderKind::FourKHdHub {
@@ -762,18 +915,22 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
             ctx,
             chat,
             wait,
-            &format!("⚠️ {}", esc(&problem.unwrap_or_else(|| "No links.".to_string()))),
+            &format!(
+                "⚠️ {}",
+                esc(&problem.unwrap_or_else(|| "No links.".to_string()))
+            ),
             None,
         )
         .await;
         return;
     }
 
-    let title = st
-        .details
-        .as_ref()
-        .map(|d| d.title.clone())
-        .unwrap_or_default();
+    let title = st.title.clone();
+    let tgt = st
+        .rel_target
+        .get(k)
+        .and_then(|ti| st.targets.get(*ti))
+        .cloned();
     let mut text = format!(
         "<b>{}</b>{}\n{}\n",
         esc(&title),
@@ -809,12 +966,12 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
     text.push('\n');
 
     // Subtitles (MovieBox)
-    if st.provider == ProviderKind::MovieBox {
-        if let (Some(rid), Some(d)) = (rel.resource_id.as_ref(), st.details.as_ref()) {
+    if rel.provider == ProviderKind::MovieBox {
+        if let (Some(rid), Some(t)) = (rel.resource_id.as_ref(), tgt.as_ref()) {
             let caps = tokio::time::timeout(
                 Duration::from_secs(15),
                 ctx.svc
-                    .get_ext_captions(&st.subject_id, rid, &d.sibling_ids(), st.season, st.episode),
+                    .get_ext_captions(&t.subject_id, rid, &t.siblings, st.season, st.episode),
             )
             .await;
             if let Ok(Ok(list)) = caps {
@@ -835,15 +992,20 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
     let sid = random_id();
     let page = format!("{}/p/{}", base.trim_end_matches('/'), sid);
     let base_text = short_html(&text);
-    let locked_text = format!(
-        "{base_text}\n\n🔒 <b>Watch 2 short ads to unlock the Play button.</b>"
-    );
+    let locked_text =
+        format!("{base_text}\n\n🔒 <b>Watch 2 short ads to unlock Play and Download.</b>");
     insert_stream(
         &ctx.streams,
         &sid,
         Stream {
             items,
             title: format!("{}{}", title, episode_tag(&st)),
+            file_base: format!(
+                "{}{} {}",
+                title,
+                episode_tag(&st),
+                rel.quality.clone().unwrap_or_default()
+            ),
             chat,
             msg: 0,
             text: base_text,
@@ -900,16 +1062,27 @@ async fn handle_message(ctx: Ctx, msg: Value) {
     let Some(chat) = msg.pointer("/chat/id").and_then(Value::as_i64) else {
         return;
     };
-    let text = msg.get("text").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let text = msg
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if text.is_empty() {
         return;
     }
     if text.starts_with("/id") {
-        let _ = ctx.tg.send(chat, &format!("Chat id: <code>{chat}</code>"), None).await;
+        let _ = ctx
+            .tg
+            .send(chat, &format!("Chat id: <code>{chat}</code>"), None)
+            .await;
         return;
     }
     if !authorised(&ctx, chat) {
-        let _ = ctx.tg.send(chat, "⛔ You are not allowed to use this bot.", None).await;
+        let _ = ctx
+            .tg
+            .send(chat, "⛔ You are not allowed to use this bot.", None)
+            .await;
         return;
     }
     if text.starts_with('/') {
@@ -924,7 +1097,10 @@ async fn handle_message(ctx: Ctx, msg: Value) {
             }
             "/search" | "/s" => {
                 if rest.is_empty() {
-                    let _ = ctx.tg.send(chat, "Usage: /search &lt;movie or series name&gt;", None).await;
+                    let _ = ctx
+                        .tg
+                        .send(chat, "Usage: /search &lt;movie or series name&gt;", None)
+                        .await;
                 } else {
                     do_search(&ctx, chat, &rest).await;
                 }
@@ -939,7 +1115,11 @@ async fn handle_message(ctx: Ctx, msg: Value) {
 }
 
 async fn handle_callback(ctx: Ctx, cq: Value) {
-    let id = cq.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    let id = cq
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     ctx.tg.answer(&id, "").await;
     let Some(chat) = cq.pointer("/message/chat/id").and_then(Value::as_i64) else {
         return;
@@ -948,20 +1128,23 @@ async fn handle_callback(ctx: Ctx, cq: Value) {
         return;
     }
     let msg_id = cq.pointer("/message/message_id").and_then(Value::as_i64);
-    let data = cq.get("data").and_then(Value::as_str).unwrap_or("").to_string();
+    let data = cq
+        .get("data")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let parts: Vec<&str> = data.split(':').collect();
     let num = |i: usize| parts.get(i).and_then(|s| s.parse::<usize>().ok());
 
     match parts.first().copied().unwrap_or("") {
-        "pv" => show_providers(&ctx, chat, msg_id).await,
-        "p" => {
-            if let (Some(pi), Some(page)) = (num(1), num(2)) {
-                show_items(&ctx, chat, msg_id, pi, page).await;
+        "g" => {
+            if let Some(page) = num(1) {
+                show_results(&ctx, chat, msg_id, page).await;
             }
         }
         "d" => {
-            if let (Some(pi), Some(j)) = (num(1), num(2)) {
-                open_item(&ctx, chat, pi, j).await;
+            if let Some(gi) = num(1) {
+                open_group(&ctx, chat, gi).await;
             }
         }
         "ss" => show_seasons(&ctx, chat, msg_id).await,
@@ -975,38 +1158,14 @@ async fn handle_callback(ctx: Ctx, cq: Value) {
                 st_set(&ctx, chat, |s| {
                     s.season = season;
                     s.episode = ep;
-                    s.dub_chosen = false;
+                    s.targets.clear();
                     s.releases.clear();
-                    s.lang = None;
+                    s.rel_target.clear();
                 });
-                proceed(&ctx, chat, msg_id).await;
+                show_audio(&ctx, chat, msg_id).await;
             }
         }
-        "a" => {
-            if let Some(k) = num(1) {
-                st_set(&ctx, chat, |s| {
-                    if let Some(sid) = s
-                        .details
-                        .as_ref()
-                        .and_then(|d| d.dubs.get(k))
-                        .map(|d| d.subject_id.clone())
-                        .filter(|x| !x.is_empty())
-                    {
-                        s.subject_id = sid;
-                    }
-                    s.dub_chosen = true;
-                });
-                fetch_releases(&ctx, chat, msg_id).await;
-            }
-        }
-        "l" => {
-            let st = st_get(&ctx, chat);
-            let langs = languages(&st.releases);
-            let choice = num(1).and_then(|k| langs.get(k).cloned());
-            st_set(&ctx, chat, |s| s.lang = choice);
-            show_qualities(&ctx, chat, msg_id).await;
-        }
-        "lm" => show_languages(&ctx, chat, msg_id).await,
+        "al" => fetch_all(&ctx, chat, msg_id).await,
         "q" => show_qualities(&ctx, chat, None).await,
         "r" => {
             if let Some(k) = num(1) {
@@ -1038,6 +1197,8 @@ struct StreamItem {
 struct Stream {
     items: Vec<StreamItem>,
     title: String,
+    /// base name of the downloaded file (title + episode + quality)
+    file_base: String,
     chat: i64,
     msg: i64,
     /// message text without the lock/unlock status line
@@ -1096,6 +1257,53 @@ fn set_stream_msg(map: &StreamMap, id: &str, msg: i64) {
     }
 }
 
+/// https://host/p/ID  ->  https://host/d/ID?n=N  (file download link)
+fn dl_url(page: &str, n: usize) -> String {
+    match page.rfind("/p/") {
+        Some(i) => format!("{}/d/{}?n={}", &page[..i], &page[i + 3..], n),
+        None => format!("{page}?n={n}"),
+    }
+}
+
+/// File extension for a download: from the link, else from the content type.
+fn file_ext(url: &str, ctype: &str) -> &'static str {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    let last = path.rsplit('/').next().unwrap_or("");
+    let ext = last
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    for known in ["mkv", "mp4", "avi", "webm", "mov", "m4v", "ts"] {
+        if ext == known {
+            return known;
+        }
+    }
+    let ct = ctype.to_ascii_lowercase();
+    if ct.contains("matroska") {
+        "mkv"
+    } else if ct.contains("webm") {
+        "webm"
+    } else {
+        "mp4"
+    }
+}
+
+/// Safe ASCII file name for the Content-Disposition header.
+fn download_name(base: &str, ext: &str) -> String {
+    let mut name = String::new();
+    for c in base.chars() {
+        if c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | '(' | ')') {
+            name.push(c);
+        } else {
+            name.push('_');
+        }
+    }
+    let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    let name = name.trim_matches(|c| c == '_' || c == ' ' || c == '.');
+    let name = if name.is_empty() { "video" } else { name };
+    format!("{name}.{ext}")
+}
+
 /// Play buttons that appear after the 2 ads were watched.
 fn play_keyboard(st: &Stream, webapp: bool) -> Value {
     let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -1103,13 +1311,18 @@ fn play_keyboard(st: &Stream, webapp: bool) -> Value {
         let page = format!("{}?n={}", st.page, i);
         let label = format!("▶️ Play: {}", short(&it.name, 30));
         if webapp {
-            rows.push(vec![json!({"text": label, "web_app": {"url": page.clone()}})]);
+            rows.push(vec![
+                json!({"text": label, "web_app": {"url": page.clone()}}),
+            ]);
         } else {
             rows.push(vec![json!({"text": label, "url": page.clone()})]);
         }
         rows.push(vec![
             json!({"text": "📱 MX Player", "url": format!("{page}&go=mx")}),
             json!({"text": "🎞 VLC", "url": format!("{page}&go=vlc")}),
+        ]);
+        rows.push(vec![
+            json!({"text": "⬇️ Download", "url": dl_url(&st.page, i)}),
         ]);
     }
     rows.push(vec![cb("⬅ Other qualities", "q".to_string())]);
@@ -1122,11 +1335,14 @@ async fn expire_task(tg: Tg, streams: StreamMap, id: String, chat: i64, msg: i64
     if let Ok(mut g) = streams.lock() {
         g.remove(&id);
     }
-    let t = format!(
-        "{text}\n\n⌛ <b>Expired.</b> Tap a quality again and watch 2 ads to play."
-    );
+    let t = format!("{text}\n\n⌛ <b>Expired.</b> Tap a quality again and watch 2 ads to play.");
     let _ = tg
-        .edit(chat, msg, &t, Some(kb(vec![vec![cb("⬅ Other qualities", "q".to_string())]])))
+        .edit(
+            chat,
+            msg,
+            &t,
+            Some(kb(vec![vec![cb("⬅ Other qualities", "q".to_string())]])),
+        )
         .await;
 }
 
@@ -1143,6 +1359,7 @@ video{display:block;width:100%;max-height:70vh;background:#000}
 .row{display:flex;gap:8px;margin:12px}
 a.b{flex:1;text-align:center;padding:12px;border-radius:10px;background:#2b6cff;color:#fff;text-decoration:none;font-weight:600}
 a.v{background:#e8730c}
+a.d{background:#198754}
 p{margin:12px;font-size:13px;color:#aaa}
 body.fs h1,body.fs .row,body.fs p{display:none}
 body.fs #wrap{position:fixed;top:0;left:0;right:0;bottom:0;z-index:99;width:100vw;height:100vh}
@@ -1153,7 +1370,7 @@ body.fs video{width:100vw;height:100vh;max-height:none;object-fit:contain}
 <video id="v" controls controlslist="nofullscreen" autoplay playsinline webkit-playsinline src="/s/__ID__?n=__N__"></video>
 <button id="fs" type="button">&#x26F6;</button>
 </div>
-<div class="row"><a class="b" id="mx" href="#">MX Player</a><a class="b v" id="vlc" href="#">VLC</a></div>
+<div class="row"><a class="b" id="mx" href="#">MX Player</a><a class="b v" id="vlc" href="#">VLC</a><a class="b d" id="dl" href="#">Download</a></div>
 <p id="msg">If the video does not start here (some formats are not supported by the in-app player), use MX Player or VLC.</p>
 <script>
 var TITLE=__TITLE_JS__, GO="__GO__";
@@ -1169,6 +1386,7 @@ function launch(k){
 }
 document.getElementById("mx").onclick=function(e){e.preventDefault();launch("mx");};
 document.getElementById("vlc").onclick=function(e){e.preventDefault();launch("vlc");};
+document.getElementById("dl").onclick=function(e){e.preventDefault();var u=location.origin+"/d/__ID__?n=__N__";if(inTg&&tg.openLink){tg.openLink(u);}else{location.href=u;}};
 document.getElementById("v").addEventListener("error",function(){document.getElementById("msg").textContent="This video format cannot play in-app. Tap MX Player or VLC above.";});
 /* Fullscreen: Telegram's webview blocks the native button, so use our own. */
 var wrap=document.getElementById("wrap");
@@ -1203,7 +1421,7 @@ button:disabled{opacity:.6}
 <h1>__TITLE__</h1>
 <div class="card">
 <h2>&#x1F512; Unlock playback</h2>
-<p>Watch 2 short ads to unlock the video. Playback stays unlocked for 6 hours.</p>
+<p>Watch 2 short ads to unlock the video and the download. It stays unlocked for 6 hours.</p>
 <div id="prog">Ads watched: 0 / 2</div>
 <button id="btn" type="button">&#x25B6; Watch ad 1 of 2</button>
 <p id="msg"></p>
@@ -1250,7 +1468,9 @@ fn player_page(id: &str, title: &str, go: &str, n: usize) -> String {
 }
 
 fn gate_page(id: &str, title: &str) -> String {
-    GATE_HTML.replace("__TITLE__", &esc(title)).replace("__ID__", id)
+    GATE_HTML
+        .replace("__TITLE__", &esc(title))
+        .replace("__ID__", id)
 }
 
 async fn http_simple(
@@ -1339,7 +1559,7 @@ async fn serve_conn(
             };
             if newly && st.msg != 0 {
                 let text = format!(
-                    "{}\n\n✅ <b>Unlocked for 6 hours.</b> Tap Play below.",
+                    "{}\n\n✅ <b>Unlocked for 6 hours.</b> Tap Play or Download below.",
                     st.text
                 );
                 if tg
@@ -1367,7 +1587,14 @@ async fn serve_conn(
 
     if let Some(id) = path.strip_prefix("/p/") {
         let Some(entry) = get(id) else {
-            http_simple(&mut sock, 404, "Not Found", "text/plain", b"Expired. Tap the quality again in the bot.").await;
+            http_simple(
+                &mut sock,
+                404,
+                "Not Found",
+                "text/plain",
+                b"Expired. Tap the quality again in the bot.",
+            )
+            .await;
             return;
         };
         let html = if entry.is_unlocked() {
@@ -1379,17 +1606,35 @@ async fn serve_conn(
         } else {
             gate_page(id, &entry.title)
         };
-        http_simple(&mut sock, 200, "OK", "text/html; charset=utf-8", html.as_bytes()).await;
+        http_simple(
+            &mut sock,
+            200,
+            "OK",
+            "text/html; charset=utf-8",
+            html.as_bytes(),
+        )
+        .await;
         return;
     }
 
-    if let Some(id) = path.strip_prefix("/s/") {
+    let route = path
+        .strip_prefix("/s/")
+        .map(|id| (id, false))
+        .or_else(|| path.strip_prefix("/d/").map(|id| (id, true)));
+    if let Some((id, download)) = route {
         let Some(entry) = get(id) else {
             http_simple(&mut sock, 404, "Not Found", "text/plain", b"Expired").await;
             return;
         };
         if !entry.is_unlocked() {
-            http_simple(&mut sock, 403, "Forbidden", "text/plain", b"Locked: watch the ads first").await;
+            http_simple(
+                &mut sock,
+                403,
+                "Forbidden",
+                "text/plain",
+                b"Locked: watch the ads first",
+            )
+            .await;
             return;
         }
         let Some(item) = entry.items.get(n).cloned() else {
@@ -1406,7 +1651,14 @@ async fn serve_conn(
         let mut resp = match req.send().await {
             Ok(r) => r,
             Err(_) => {
-                http_simple(&mut sock, 502, "Bad Gateway", "text/plain", b"upstream error").await;
+                http_simple(
+                    &mut sock,
+                    502,
+                    "Bad Gateway",
+                    "text/plain",
+                    b"upstream error",
+                )
+                .await;
                 return;
             }
         };
@@ -1417,6 +1669,7 @@ async fn serve_conn(
             status.canonical_reason().unwrap_or("OK")
         );
         let mut has_ct = false;
+        let mut ctype = String::new();
         for name in [
             "content-type",
             "content-length",
@@ -1428,12 +1681,19 @@ async fn serve_conn(
             if let Some(v) = resp.headers().get(name).and_then(|v| v.to_str().ok()) {
                 if name == "content-type" {
                     has_ct = true;
+                    ctype = v.to_string();
                 }
                 out.push_str(&format!("{name}: {v}\r\n"));
             }
         }
         if !has_ct {
             out.push_str("content-type: video/mp4\r\n");
+        }
+        if download {
+            let fname = download_name(&entry.file_base, file_ext(&item.url, &ctype));
+            out.push_str(&format!(
+                "content-disposition: attachment; filename=\"{fname}\"\r\n"
+            ));
         }
         out.push_str("access-control-allow-origin: *\r\nconnection: close\r\n\r\n");
         if sock.write_all(out.as_bytes()).await.is_err() {
@@ -1451,7 +1711,14 @@ async fn serve_conn(
         return;
     }
 
-    http_simple(&mut sock, 200, "OK", "text/plain", b"MahSurat Stream Bot player server").await;
+    http_simple(
+        &mut sock,
+        200,
+        "OK",
+        "text/plain",
+        b"MahSurat Stream Bot player server",
+    )
+    .await;
 }
 
 async fn server_task(listener: tokio::net::TcpListener, streams: StreamMap, tg: Tg) {
@@ -1487,7 +1754,11 @@ fn extract_tunnel(line: &str) -> Option<String> {
 async fn tunnel_task(base: Arc<Mutex<Option<String>>>, port: u16) {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let bin = std::env::var("CLOUDFLARED_BIN").unwrap_or_else(|_| {
-        let name = if cfg!(windows) { "cloudflared.exe" } else { "cloudflared" };
+        let name = if cfg!(windows) {
+            "cloudflared.exe"
+        } else {
+            "cloudflared"
+        };
         std::env::current_exe()
             .ok()
             .and_then(|e| e.parent().map(|d| d.join(name)))
@@ -1589,7 +1860,9 @@ async fn main() {
                 i += 1;
             }
             "--help" | "-h" => {
-                println!("moviebox-tgbot [--token BOT_TOKEN] [--allow CHAT_ID,CHAT_ID]\n\nThe token and allowed ids are saved, so next time just run: moviebox-tgbot");
+                println!(
+                    "moviebox-tgbot [--token BOT_TOKEN] [--allow CHAT_ID,CHAT_ID]\n\nThe token and allowed ids are saved, so next time just run: moviebox-tgbot"
+                );
                 return;
             }
             _ => {}
@@ -1597,7 +1870,9 @@ async fn main() {
         i += 1;
     }
 
-    let env_token = std::env::var("BOT_TOKEN").ok().filter(|t| !t.trim().is_empty());
+    let env_token = std::env::var("BOT_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
     let mut token = arg_token.or(env_token).or_else(|| read_config("token"));
     if token.is_none() {
         use std::io::{BufRead, IsTerminal, Write};
@@ -1620,7 +1895,11 @@ async fn main() {
         }
     };
     let allow_raw = arg_allow
-        .or_else(|| std::env::var("ALLOWED_CHAT_IDS").ok().filter(|v| !v.trim().is_empty()))
+        .or_else(|| {
+            std::env::var("ALLOWED_CHAT_IDS")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
         .or_else(|| read_config("allow"))
         .unwrap_or_default();
     let on_github = std::env::var("GITHUB_ACTIONS").is_ok();
@@ -1671,8 +1950,12 @@ async fn main() {
         )
         .await;
 
-    println!("Bot started ({})", if on_github { "GitHub Actions" } else { "local" });
-    let deadline: Option<Instant> = run_minutes.map(|m| Instant::now() + Duration::from_secs(m * 60));
+    println!(
+        "Bot started ({})",
+        if on_github { "GitHub Actions" } else { "local" }
+    );
+    let deadline: Option<Instant> =
+        run_minutes.map(|m| Instant::now() + Duration::from_secs(m * 60));
     let mut offset: i64 = 0;
 
     while deadline.is_none_or(|d| Instant::now() < d) {
@@ -1714,4 +1997,90 @@ async fn main() {
         .call("getUpdates", &json!({"offset": offset, "timeout": 0}))
         .await;
     println!("Run window finished; exiting");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use moviebox_tui::providers::models::ProviderMediaId;
+
+    fn item(p: ProviderKind, id: &str, title: &str, year: Option<&str>) -> CatalogItem {
+        CatalogItem {
+            id: ProviderMediaId {
+                provider: p,
+                value: id.to_string(),
+            },
+            title: title.to_string(),
+            media_type: MediaType::Movie,
+            year: year.map(str::to_string),
+            poster_url: None,
+            season_count: None,
+        }
+    }
+
+    #[test]
+    fn same_name_and_year_merge_across_providers() {
+        let results = vec![
+            (
+                ProviderKind::MovieBox,
+                vec![
+                    item(ProviderKind::MovieBox, "m1", "Alpha", Some("2025")),
+                    item(ProviderKind::MovieBox, "m2", "Alpha", Some("2013")),
+                ],
+            ),
+            (
+                ProviderKind::Dramachi,
+                vec![item(
+                    ProviderKind::Dramachi,
+                    "d1",
+                    "Alpha (2025)",
+                    Some("2025-03-01"),
+                )],
+            ),
+            (
+                ProviderKind::Addons,
+                vec![item(
+                    ProviderKind::Addons,
+                    "movie:tt1",
+                    "The Alpha",
+                    Some("2025"),
+                )],
+            ),
+        ];
+        let groups = build_groups(&results);
+        assert_eq!(groups.len(), 2, "Alpha 2025 and Alpha 2013 stay separate");
+        // the title found on the most providers comes first
+        assert_eq!(groups[0].year, "2025");
+        assert_eq!(distinct_providers(&groups[0].members), 3);
+        assert_eq!(groups[1].year, "2013");
+        assert_eq!(groups[1].members.len(), 1);
+    }
+
+    #[test]
+    fn titles_and_years_are_normalised() {
+        assert_eq!(norm_title("The Avengers [Hindi]"), "avengers");
+        assert_eq!(norm_title("Tom & Jerry"), "tom and jerry");
+        assert_eq!(year_of(Some("Released 2012-05-04")), "2012");
+        assert_eq!(year_of(Some("n/a")), "");
+        assert_eq!(clean_title("Alpha [Hindi] (2025)"), "Alpha");
+    }
+
+    #[test]
+    fn download_link_and_file_name() {
+        assert_eq!(
+            dl_url("https://x.trycloudflare.com/p/abc123", 2),
+            "https://x.trycloudflare.com/d/abc123?n=2"
+        );
+        assert_eq!(
+            file_ext("https://h/a/movie.mkv?token=1", "video/mp4"),
+            "mkv"
+        );
+        assert_eq!(file_ext("https://h/stream", "video/x-matroska"), "mkv");
+        assert_eq!(file_ext("https://h/stream", ""), "mp4");
+        assert_eq!(
+            download_name("Alpha (2025) 2160p", "mkv"),
+            "Alpha (2025) 2160p.mkv"
+        );
+        assert_eq!(download_name("___", "mp4"), "video.mp4");
+    }
 }
