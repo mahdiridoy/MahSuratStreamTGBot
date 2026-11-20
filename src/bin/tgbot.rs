@@ -234,6 +234,16 @@ You get direct stream/download links + subtitles when available.\n\n\
 
 // ----------------------------------------------------------------- Search
 
+/// Providers the bot searches (the TUI list plus built-in Stremio addons).
+const BOT_PROVIDERS: [ProviderKind; 6] = [
+    ProviderKind::MovieBox,
+    ProviderKind::FourKHdHub,
+    ProviderKind::Dramachi,
+    ProviderKind::BdixCircleFtp,
+    ProviderKind::BdixDhakaFlix,
+    ProviderKind::Addons,
+];
+
 async fn do_search(ctx: &Ctx, chat: i64, query: &str) {
     let wait = ctx
         .tg
@@ -241,7 +251,7 @@ async fn do_search(ctx: &Ctx, chat: i64, query: &str) {
         .await
         .ok();
 
-    let futs = ProviderKind::ENABLED.into_iter().map(|p| {
+    let futs = BOT_PROVIDERS.into_iter().map(|p| {
         let svc = ctx.svc.clone();
         let q = query.to_string();
         async move {
@@ -571,9 +581,9 @@ async fn provider_streams(
         ProviderKind::BdixDhakaFlix => {
             ReleaseProvider::episode_streams(&svc.dhakaflix_client, id, season, episode).await
         }
-        ProviderKind::Addons => Err(ProviderError::Unavailable(
-            "Addons are not supported in the bot".to_string(),
-        )),
+        ProviderKind::Addons => {
+            ReleaseProvider::episode_streams(&svc.addon_client, id, season, episode).await
+        }
     }
 }
 
