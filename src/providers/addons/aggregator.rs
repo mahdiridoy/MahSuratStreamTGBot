@@ -50,7 +50,7 @@ pub async fn aggregate_streams(
 
         tasks.push(async move {
             let streams_res = tokio::time::timeout(
-                std::time::Duration::from_millis(5000),
+                std::time::Duration::from_millis(10000),
                 client_clone.fetch_streams(&base_url, &m_type, &id_clone),
             )
             .await;

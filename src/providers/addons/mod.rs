@@ -9,10 +9,92 @@ pub use adapter::{
 };
 pub use aggregator::aggregate_streams;
 pub use client::AddonClient;
-pub use models::{AddonManifest, InstalledAddon, MetaDetail, MetaItem, StreamItem};
+pub use models::{
+    AddonManifest, BUILTIN_ADDON_MANIFESTS, InstalledAddon, MetaDetail, MetaItem, StreamItem,
+};
 
-use crate::providers::models::{CatalogItem, MediaDetails, ProviderError, ProviderKind};
-use crate::providers::{Provider, ProviderCapabilities};
+use crate::providers::models::{CatalogItem, MediaDetails, ProviderError, ProviderKind, Release};
+use crate::providers::{Provider, ProviderCapabilities, ReleaseProvider};
+use std::time::Duration;
+
+/// Saved addons (`addons_config.json`) plus the built-in ones that are not saved yet.
+/// Built-in manifests are fetched (cached) to learn what each addon provides.
+pub async fn load_effective_addons(client: &AddonClient) -> Vec<InstalledAddon> {
+    let mut list = tokio::task::spawn_blocking(crate::config::load_addons)
+        .await
+        .unwrap_or_default();
+
+    let missing: Vec<(&str, &str)> = BUILTIN_ADDON_MANIFESTS
+        .iter()
+        .copied()
+        .filter(|(_, url)| !list.iter().any(|a| a.manifest_url == *url))
+        .collect();
+
+    let futs = missing.into_iter().map(|(name, url)| async move {
+        match tokio::time::timeout(Duration::from_secs(6), client.fetch_manifest(url)).await {
+            Ok(Ok(manifest)) => InstalledAddon::from_manifest(url.to_string(), &manifest),
+            _ => InstalledAddon::builtin_fallback(name, url),
+        }
+    });
+    list.extend(futures::future::join_all(futs).await);
+    list
+}
+
+impl AddonClient {
+    /// (type, catalog id) pairs of an addon that can be searched.
+    async fn search_targets(&self, addon: &InstalledAddon) -> Vec<(String, String)> {
+        if addon.is_core() {
+            return vec![
+                ("movie".to_string(), "top".to_string()),
+                ("series".to_string(), "top".to_string()),
+            ];
+        }
+        let manifest = match tokio::time::timeout(
+            Duration::from_secs(6),
+            self.fetch_manifest(&addon.manifest_url),
+        )
+        .await
+        {
+            Ok(Ok(m)) => m,
+            _ => return Vec::new(),
+        };
+        manifest
+            .catalogs
+            .iter()
+            .filter(|c| {
+                (c.r#type == "movie" || c.r#type == "series")
+                    && c.extra
+                        .iter()
+                        .any(|e| e.name.eq_ignore_ascii_case("search"))
+            })
+            .map(|c| (c.r#type.clone(), c.id.clone()))
+            .collect()
+    }
+}
+
+impl ReleaseProvider for AddonClient {
+    async fn episode_streams(
+        &self,
+        id: &str,
+        season: usize,
+        episode: usize,
+    ) -> Result<Vec<Release>, ProviderError> {
+        let addons = load_effective_addons(self).await;
+        let is_series = id.starts_with("series:") || season > 0;
+        let (releases, blocked) =
+            aggregate_streams(self, &addons, id, season, episode, is_series).await;
+        if releases.is_empty() {
+            if !blocked.is_empty() {
+                return Err(ProviderError::Unavailable(format!(
+                    "Only torrent/magnet streams were found ({}); direct links need a debrid-enabled addon.",
+                    blocked.join(", ")
+                )));
+            }
+            return Err(ProviderError::NotFound);
+        }
+        Ok(releases)
+    }
+}
 
 impl Provider for AddonClient {
     fn id(&self) -> ProviderKind {
@@ -30,12 +112,11 @@ impl Provider for AddonClient {
     }
 
     async fn search(&self, query: &str, _page: usize) -> Result<Vec<CatalogItem>, ProviderError> {
-        let addons = tokio::task::spawn_blocking(crate::config::load_addons)
-            .await
-            .unwrap_or_default();
-        let catalog_addons: Vec<_> = addons
+        let addons = load_effective_addons(self).await;
+        let catalog_addons: Vec<InstalledAddon> = addons
             .iter()
             .filter(|a| a.enabled && (a.provides_meta || a.provides_catalog))
+            .cloned()
             .collect();
 
         if catalog_addons.is_empty() {
@@ -44,23 +125,37 @@ impl Provider for AddonClient {
             ));
         }
 
-        let mut combined = Vec::new();
-        for addon in catalog_addons {
+        // Search every catalog-capable addon at the same time (Cinemeta stays first).
+        let tasks = catalog_addons.into_iter().map(|addon| async move {
             let base_url = Self::base_addon_url(&addon.manifest_url);
-            let (movies_res, series_res) = tokio::join!(
-                self.fetch_catalog_search(&base_url, "movie", "top", query),
-                self.fetch_catalog_search(&base_url, "series", "top", query),
-            );
-            if let Ok(movies) = movies_res {
-                combined.extend(movies);
+            let targets = self.search_targets(&addon).await;
+            let mut found: Vec<MetaItem> = Vec::new();
+            let searches = targets.iter().map(|(media_type, catalog_id)| {
+                let base_url = base_url.clone();
+                async move {
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        self.fetch_catalog_search(&base_url, media_type, catalog_id, query),
+                    )
+                    .await
+                }
+            });
+            for res in futures::future::join_all(searches).await {
+                if let Ok(Ok(metas)) = res {
+                    found.extend(metas);
+                }
             }
-            if let Ok(series) = series_res {
-                combined.extend(series);
+            // Stream addons are queried by IMDb id, so keep only items they can resolve.
+            if !addon.is_core() {
+                found.retain(|m| m.id.starts_with("tt"));
             }
-            if !combined.is_empty() {
-                break;
-            }
-        }
+            found
+        });
+        let combined: Vec<MetaItem> = futures::future::join_all(tasks)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
 
         let mut seen = std::collections::HashSet::new();
         Ok(combined
@@ -81,9 +176,7 @@ impl Provider for AddonClient {
             _ => (None, id),
         };
 
-        let addons = tokio::task::spawn_blocking(crate::config::load_addons)
-            .await
-            .unwrap_or_default();
+        let addons = load_effective_addons(self).await;
         let mut target_addons: Vec<_> = addons
             .iter()
             .filter(|a| a.enabled && a.provides_meta)

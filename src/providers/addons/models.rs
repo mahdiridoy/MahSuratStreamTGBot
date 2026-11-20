@@ -440,6 +440,41 @@ pub struct InstalledAddon {
     pub types: Vec<String>,
 }
 
+/// Addons built into the bot. They work with no manual setup and are merged
+/// with whatever is saved in `addons_config.json` (user entries win).
+pub const BUILTIN_ADDON_MANIFESTS: &[(&str, &str)] = &[
+    ("Torrentio", "https://torrentio.strem.fun/manifest.json"),
+    ("Comet", "https://comet.elfhosted.com/manifest.json"),
+    (
+        "Netflix Catalog",
+        "https://7a82163c306e-stremio-netflix-catalog-addon.baby-beamup.club/manifest.json",
+    ),
+    (
+        "MediaFusion",
+        "https://mediafusion.elfhosted.com/manifest.json",
+    ),
+    (
+        "AIOStreams",
+        "https://aiostreams.elfhosted.com/stremio/manifest.json",
+    ),
+    (
+        "ThePirateBay+",
+        "https://thepiratebay-plus.strem.fun/manifest.json",
+    ),
+    (
+        "Top Streaming",
+        "https://top-streaming.stream/manifest.json",
+    ),
+    (
+        "NoTorrent",
+        "https://addon.notorrent2.workers.dev/manifest.json",
+    ),
+    (
+        "HDHub",
+        "https://hdhub.thevolecitor.qzz.io/eyJ0b3Jib3giOiJ1bnNldCIsInF1YWxpdGllcyI6IjIxNjBwLDEwODBwLDcyMHAiLCJzb3J0IjoiZGVzYyJ9/manifest.json",
+    ),
+];
+
 impl InstalledAddon {
     pub const CINEMETA_MANIFEST: &'static str = "https://v3-cinemeta.strem.io/manifest.json";
 
@@ -453,6 +488,23 @@ impl InstalledAddon {
             provides_catalog: true,
             provides_meta: true,
             provides_stream: false,
+            id_prefixes: vec!["tt".to_string()],
+            types: vec!["movie".to_string(), "series".to_string()],
+        }
+    }
+
+    /// Used when a built-in addon's manifest cannot be fetched right now:
+    /// assume it is a stream addon for IMDb (`tt`) ids.
+    pub fn builtin_fallback(name: &str, manifest_url: &str) -> Self {
+        Self {
+            manifest_url: manifest_url.to_string(),
+            name: name.to_string(),
+            version: None,
+            description: Some("Built-in addon".to_string()),
+            enabled: true,
+            provides_catalog: false,
+            provides_meta: false,
+            provides_stream: true,
             id_prefixes: vec!["tt".to_string()],
             types: vec!["movie".to_string(), "series".to_string()],
         }
