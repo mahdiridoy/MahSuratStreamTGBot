@@ -133,6 +133,8 @@ struct ChatState {
     releases: Vec<Release>,
     /// For every release: index into `targets`
     rel_target: Vec<usize>,
+    /// Releases whose links turned out to be dead (hidden from the list)
+    dead: Vec<usize>,
 }
 
 /// One provider subject the streams were fetched from.
@@ -632,6 +634,7 @@ async fn open_group(ctx: &Ctx, chat: i64, gi: usize) {
         s.targets.clear();
         s.releases.clear();
         s.rel_target.clear();
+        s.dead.clear();
     });
 
     let mut sent_photo = false;
@@ -768,13 +771,22 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
         Some(m) => {
             let _ = ctx
                 .tg
-                .edit(chat, m, "⏳ Fetching streams from all providers…", None)
+                .edit(
+                    chat,
+                    m,
+                    "⏳ Fetching streams from all providers and checking the links…",
+                    None,
+                )
                 .await;
             Some(m)
         }
         None => ctx
             .tg
-            .send(chat, "⏳ Fetching streams from all providers…", None)
+            .send(
+                chat,
+                "⏳ Fetching streams from all providers and checking the links…",
+                None,
+            )
             .await
             .ok(),
     };
@@ -830,6 +842,45 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
             Err(_) => errs.push(format!("{} timed out.", p.label())),
         }
     }
+    // Hide dead links (404, error pages, ...). 4KHDHub pages are resolved and
+    // checked later, when the quality is tapped.
+    {
+        use futures::StreamExt;
+        let mut jobs: Vec<ProbeJob> = Vec::new();
+        for (i, (rel, _)) in tagged.iter().enumerate() {
+            if rel.provider == ProviderKind::FourKHdHub {
+                continue;
+            }
+            for (mi, m) in rel.mirrors.iter().enumerate().take(2) {
+                jobs.push((i, mi, m.resolver_url.clone(), m.headers.clone()));
+            }
+        }
+        let checked: Vec<(usize, usize, bool)> = futures::stream::iter(jobs)
+            .map(|(i, mi, url, headers)| async move {
+                (i, mi, link_works(probe_client(), &url, &headers).await)
+            })
+            .buffer_unordered(40)
+            .collect()
+            .await;
+        let dead: std::collections::HashSet<(usize, usize)> = checked
+            .into_iter()
+            .filter(|(_, _, ok)| !ok)
+            .map(|(i, mi, _)| (i, mi))
+            .collect();
+        for (i, (rel, _)) in tagged.iter_mut().enumerate() {
+            if rel.provider == ProviderKind::FourKHdHub {
+                continue;
+            }
+            let mut mi = 0usize;
+            rel.mirrors.retain(|_| {
+                let keep = !dead.contains(&(i, mi));
+                mi += 1;
+                keep
+            });
+        }
+        tagged
+            .retain(|(rel, _)| rel.provider == ProviderKind::FourKHdHub || !rel.mirrors.is_empty());
+    }
     if tagged.is_empty() {
         let mut text = "⚠️ No streams found for this item.".to_string();
         errs.dedup();
@@ -849,6 +900,7 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
         s.targets = targets;
         s.releases = releases;
         s.rel_target = rel_target;
+        s.dead.clear();
     });
     show_qualities(ctx, chat, target_msg).await;
 }
@@ -856,16 +908,103 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
 async fn show_qualities(ctx: &Ctx, chat: i64, msg: Option<i64>) {
     let st = st_get(ctx, chat);
     let mut rows: Vec<Vec<Value>> = Vec::new();
-    for (i, r) in st.releases.iter().enumerate().take(MAX_QUALITY_BUTTONS) {
+    let live: Vec<(usize, &Release)> = st
+        .releases
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !st.dead.contains(i))
+        .collect();
+    for (i, r) in live.iter().take(MAX_QUALITY_BUTTONS) {
         rows.push(vec![cb(&rel_label(r), format!("r:{i}"))]);
     }
     let text = format!(
         "<b>{}</b>{}\nChoose quality / source ({} available):",
         esc(&st.title),
         esc(&episode_tag(&st)),
-        st.releases.len()
+        live.len()
     );
     show(ctx, chat, msg, &text, Some(kb(rows))).await;
+}
+
+// ------------------------------------------------------------ Link checking
+
+/// (release index, mirror index, url, headers)
+type ProbeJob = (usize, usize, String, Vec<(String, String)>);
+
+fn probe_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(6))
+            .user_agent("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36")
+            .build()
+            .unwrap_or_default()
+    })
+}
+
+fn host_of(url: &str) -> &str {
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+}
+
+/// A link is only shown when it passes both tests.
+const MIN_LINK_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Two tests before a link is sent to the user:
+/// 1. the link answers HTTP 200 (206 when the host honours our Range request)
+/// 2. the file is bigger than 50 MB
+///
+/// Err(reason) means the link is hidden.
+async fn link_status(
+    http: &reqwest::Client,
+    url: &str,
+    headers: &[(String, String)],
+) -> Result<(), String> {
+    let mut req = http.get(url).header("Range", "bytes=0-1");
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let resp = match tokio::time::timeout(Duration::from_secs(10), req.send()).await {
+        Err(_) => return Err("no answer (timed out)".to_string()),
+        Ok(Err(_)) => return Err("cannot connect".to_string()),
+        Ok(Ok(r)) => r,
+    };
+
+    // Test 1: HTTP 200
+    let status = resp.status().as_u16();
+    if status != 200 && status != 206 {
+        return Err(format!("HTTP {status}"));
+    }
+
+    // Test 2: size greater than 50 MB
+    let header_num = |name: &str| -> Option<u64> {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+    let total = if status == 206 {
+        resp.headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit('/').next())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    } else {
+        header_num("content-length")
+    };
+    match total {
+        Some(t) if t > MIN_LINK_BYTES => Ok(()),
+        Some(t) => Err(format!("file is only {} MB", t / (1024 * 1024))),
+        None => Err("file size unknown".to_string()),
+    }
+}
+
+async fn link_works(http: &reqwest::Client, url: &str, headers: &[(String, String)]) -> bool {
+    link_status(http, url, headers).await.is_ok()
 }
 
 // ------------------------------------------------------------------ Links
@@ -920,6 +1059,48 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
                 esc(&problem.unwrap_or_else(|| "No links.".to_string()))
             ),
             None,
+        )
+        .await;
+        return;
+    }
+
+    // Drop links that are dead so Play / Download never get them.
+    let checks = futures::future::join_all(
+        links
+            .iter()
+            .map(|(_, url, headers)| link_status(probe_client(), url, headers)),
+    )
+    .await;
+    let mut reason: Option<String> = None;
+    let mut alive: Vec<LinkEntry> = Vec::new();
+    for (l, c) in links.into_iter().zip(checks) {
+        match c {
+            Ok(()) => alive.push(l),
+            Err(e) => {
+                if reason.is_none() {
+                    reason = Some(format!("{e} on {}", host_of(&l.1)));
+                }
+            }
+        }
+    }
+    let links = alive;
+    if links.is_empty() {
+        st_set(ctx, chat, |s| {
+            if !s.dead.contains(&k) {
+                s.dead.push(k);
+            }
+        });
+        let rows = vec![vec![cb("⬅ Other qualities", "q".to_string())]];
+        let why = reason.unwrap_or_else(|| "no working link".to_string());
+        show(
+            ctx,
+            chat,
+            wait,
+            &format!(
+                "⚠️ This link is not working ({}), so I removed it from the list. Please pick another quality.",
+                esc(&why)
+            ),
+            Some(kb(rows)),
         )
         .await;
         return;
@@ -1161,6 +1342,7 @@ async fn handle_callback(ctx: Ctx, cq: Value) {
                     s.targets.clear();
                     s.releases.clear();
                     s.rel_target.clear();
+                    s.dead.clear();
                 });
                 show_audio(&ctx, chat, msg_id).await;
             }
@@ -1650,7 +1832,8 @@ async fn serve_conn(
         }
         let mut resp = match req.send().await {
             Ok(r) => r,
-            Err(_) => {
+            Err(e) => {
+                eprintln!("[proxy] upstream error for {}: {e}", host_of(&item.url));
                 http_simple(
                     &mut sock,
                     502,
@@ -1663,6 +1846,13 @@ async fn serve_conn(
             }
         };
         let status = resp.status();
+        if status.as_u16() >= 400 {
+            eprintln!(
+                "[proxy] upstream HTTP {} for {}",
+                status.as_u16(),
+                host_of(&item.url)
+            );
+        }
         let mut out = format!(
             "HTTP/1.1 {} {}\r\n",
             status.as_u16(),
@@ -2082,5 +2272,74 @@ mod tests {
             "Alpha (2025) 2160p.mkv"
         );
         assert_eq!(download_name("___", "mp4"), "video.mp4");
+    }
+
+    async fn serve_once(
+        status_line: &'static str,
+        headers: &'static str,
+        body: &'static [u8],
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let head = format!("HTTP/1.1 {status_line}\r\n{headers}connection: close\r\n\r\n");
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        format!("http://{addr}/file.mkv")
+    }
+
+    #[tokio::test]
+    async fn links_need_http_200_and_more_than_50mb() {
+        let http = reqwest::Client::new();
+
+        // passes: 206 and a 5 GB file
+        let big = serve_once(
+            "206 Partial Content",
+            "content-type: video/x-matroska\r\ncontent-range: bytes 0-1/5000000000\r\ncontent-length: 2\r\n",
+            b"ab",
+        )
+        .await;
+        assert!(link_status(&http, &big, &[]).await.is_ok());
+
+        // passes: host ignores Range, answers 200 with a 700 MB length
+        let full = serve_once(
+            "200 OK",
+            "content-type: video/mp4\r\ncontent-length: 734003200\r\n",
+            b"x",
+        )
+        .await;
+        assert!(link_status(&http, &full, &[]).await.is_ok());
+
+        // fails test 1: not found
+        let missing = serve_once(
+            "404 Not Found",
+            "content-type: text/plain\r\ncontent-length: 0\r\n",
+            b"",
+        )
+        .await;
+        assert_eq!(
+            link_status(&http, &missing, &[]).await,
+            Err("HTTP 404".to_string())
+        );
+
+        // fails test 2: only 20 MB
+        let small = serve_once(
+            "206 Partial Content",
+            "content-range: bytes 0-1/20971520\r\ncontent-length: 2\r\n",
+            b"ab",
+        )
+        .await;
+        assert!(link_status(&http, &small, &[]).await.is_err());
+
+        // fails test 2: size unknown
+        let unknown = serve_once("200 OK", "content-type: video/mp4\r\n", b"x").await;
+        assert!(link_status(&http, &unknown, &[]).await.is_err());
     }
 }
