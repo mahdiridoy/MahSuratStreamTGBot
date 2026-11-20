@@ -29,3 +29,10 @@ The Addon Manager lets you add, enable, or remove addon manifests:
 Installed addons are saved to `addons_config.json` in your configuration directory:
 - **Linux / macOS / Termux**: `~/.config/moviebox-tui/addons_config.json`
 - **Windows**: `%APPDATA%\MovieBox-Tui\addons_config.json`
+
+## Built-in addons (Telegram bot)
+
+The Telegram bot searches Stremio addons as the **Addons** provider and ships with these addons built in (no setup):
+Torrentio, Comet, Netflix Catalog, MediaFusion, AIOStreams, ThePirateBay+, Top Streaming, NoTorrent, HDHub.
+They are merged with `addons_config.json`; the list lives in `BUILTIN_ADDON_MANIFESTS` (`src/providers/addons/models.rs`).
+Only streams with a direct HTTP link are playable; torrent-only (`infoHash`) results need a debrid-enabled addon URL.
