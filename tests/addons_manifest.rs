@@ -211,6 +211,7 @@ fn test_addon_stream_parsing_and_release_mapping() {
         description: None,
         url: Some("https://cdn.hubcloud.club/stream/breakingbad_s01e01.mp4".to_string()),
         behavior_hints: Some(StreamBehaviorHints {
+            proxy_headers: None,
             not_web_ready: false,
             headers: Some(headers),
             video_size: Some(1_234_567_890),
@@ -422,4 +423,27 @@ async fn test_addon_enable_disable_and_removal_lifecycle() {
     app.handle_action(moviebox_tui::tui::action::Action::AddonRemove(idx))
         .await;
     assert_eq!(app.state().installed_addons.len(), initial_count);
+}
+
+#[test]
+fn proxy_headers_from_stream_are_kept() {
+    let json = r#"{
+        "name": "HdHub\n1080p",
+        "title": "Alpha.2026.1080p.Hindi.x265.mkv\n5.65 GB",
+        "url": "https://files.example.com/alpha.mkv",
+        "behaviorHints": {
+            "notWebReady": true,
+            "proxyHeaders": { "request": { "Referer": "https://hub.example.com/", "User-Agent": "Mozilla/5.0", "X-Other": "no" } }
+        }
+    }"#;
+    let stream: StreamItem = serde_json::from_str(json).expect("stream json");
+    let release = stream_item_to_release("HdHub", &stream, 0, 0).expect("release");
+    let headers = &release.mirrors[0].headers;
+    assert!(
+        headers
+            .iter()
+            .any(|(k, v)| k == "Referer" && v == "https://hub.example.com/")
+    );
+    assert!(headers.iter().any(|(k, _)| k == "User-Agent"));
+    assert!(!headers.iter().any(|(k, _)| k == "X-Other"));
 }
