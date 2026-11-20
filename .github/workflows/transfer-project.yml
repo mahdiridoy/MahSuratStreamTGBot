@@ -32,7 +32,7 @@ jobs:
 
       - name: Transfer All Files
         run: |
-          cp -a MMahSuratStreamTGBot-main/. .
+          cp -a MahSuratStreamTGBot-main/. .
           rm -rf MahSuratStreamTGBot-main
 
       - name: Commit and Push
