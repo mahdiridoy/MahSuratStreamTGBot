@@ -507,22 +507,42 @@ pub fn stream_item_to_release(
     let source_label = crate::providers::models::clean_stream_text(&raw_source_label);
     let language = language.map(|l| crate::providers::models::clean_stream_text(&l));
 
-    let mut headers = Vec::new();
-    if let Some(hints) = &stream.behavior_hints
-        && let Some(hdr_map) = &hints.headers
-    {
-        const ALLOWED_HEADERS: &[&str] = &[
-            "user-agent",
-            "referer",
-            "origin",
-            "range",
-            "x-forwarded-for",
-            "accept",
-            "accept-language",
-        ];
-        for (k, v) in hdr_map {
-            if ALLOWED_HEADERS.contains(&k.to_ascii_lowercase().as_str()) {
-                headers.push((k.clone(), v.clone()));
+    // Headers the file host needs (Referer, User-Agent, ...). Stremio addons
+    // send them as `behaviorHints.headers` or `behaviorHints.proxyHeaders.request`.
+    const ALLOWED_HEADERS: &[&str] = &[
+        "user-agent",
+        "referer",
+        "origin",
+        "range",
+        "x-forwarded-for",
+        "accept",
+        "accept-language",
+        "authorization",
+        "cookie",
+    ];
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let mut add = |k: &str, v: &str| {
+        if ALLOWED_HEADERS.contains(&k.to_ascii_lowercase().as_str())
+            && !headers.iter().any(|(hk, _)| hk.eq_ignore_ascii_case(k))
+        {
+            headers.push((k.to_string(), v.to_string()));
+        }
+    };
+    if let Some(hints) = &stream.behavior_hints {
+        if let Some(hdr_map) = &hints.headers {
+            for (k, v) in hdr_map {
+                add(k, v);
+            }
+        }
+        if let Some(req) = hints
+            .proxy_headers
+            .as_ref()
+            .and_then(|p| p.request.as_ref())
+        {
+            for (k, v) in req {
+                if let Some(v) = v.as_str() {
+                    add(k, v);
+                }
             }
         }
     }

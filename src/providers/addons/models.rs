@@ -400,12 +400,21 @@ pub struct MetaDetail {
     pub videos: Vec<MetaVideo>,
 }
 
+/// Stremio `behaviorHints.proxyHeaders`: headers the file host expects.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProxyHeaders {
+    #[serde(default)]
+    pub request: Option<HashMap<String, serde_json::Value>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StreamBehaviorHints {
     #[serde(rename = "notWebReady", default)]
     pub not_web_ready: bool,
     #[serde(default)]
     pub headers: Option<HashMap<String, String>>,
+    #[serde(rename = "proxyHeaders", default)]
+    pub proxy_headers: Option<ProxyHeaders>,
     #[serde(rename = "videoSize")]
     pub video_size: Option<u64>,
     pub filename: Option<String>,
