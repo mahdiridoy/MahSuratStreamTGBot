@@ -1511,9 +1511,71 @@ fn play_keyboard(st: &Stream, webapp: bool) -> Value {
     kb(rows)
 }
 
-/// 6 hours after unlocking: remove the Play buttons and the stream.
-async fn expire_task(tg: Tg, streams: StreamMap, id: String, chat: i64, msg: i64, text: String) {
-    tokio::time::sleep(Duration::from_secs(UNLOCK_SECS)).await;
+/// How often the countdown in the message is refreshed (Telegram limits how
+/// fast a bot may edit a message, so it ticks every few seconds).
+const COUNTDOWN_TICK_SECS: u64 = 5;
+
+/// 7325 -> "02:02:05" (hours:minutes:seconds)
+fn fmt_hms(secs: u64) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
+fn unlocked_text(text: &str, secs_left: u64) -> String {
+    format!(
+        "{text}\n\n✅ <b>Unlocked.</b> Tap Play or Download below.\n⏱ Time left: <b>{}</b> (hr:min:sec)",
+        fmt_hms(secs_left)
+    )
+}
+
+/// After unlocking: count down in the message (hr:min:sec), and when the time
+/// is over remove the Play buttons and the stream.
+#[allow(clippy::too_many_arguments)]
+async fn countdown_task(
+    tg: Tg,
+    streams: StreamMap,
+    id: String,
+    chat: i64,
+    msg: i64,
+    text: String,
+    keyboard: Value,
+    deadline: Instant,
+) {
+    let mut editing = true;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let left = deadline - now;
+        if !editing {
+            // Message was deleted: just wait for the end.
+            tokio::time::sleep(left).await;
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(COUNTDOWN_TICK_SECS).min(left)).await;
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let secs_left = (deadline - now).as_secs();
+        let t = unlocked_text(&text, secs_left);
+        if let Err(e) = tg.edit(chat, msg, &t, Some(keyboard.clone())).await {
+            let e = e.to_ascii_lowercase();
+            if e.contains("not found")
+                || e.contains("message_id_invalid")
+                || e.contains("can't be edited")
+            {
+                editing = false;
+            } else if e.contains("too many requests") || e.contains("retry after") {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+            }
+        }
+    }
     if let Ok(mut g) = streams.lock() {
         g.remove(&id);
     }
@@ -1740,26 +1802,29 @@ async fn serve_conn(
                 return;
             };
             if newly && st.msg != 0 {
-                let text = format!(
-                    "{}\n\n✅ <b>Unlocked for 6 hours.</b> Tap Play or Download below.",
-                    st.text
-                );
+                let deadline =
+                    st.unlocked_at.unwrap_or_else(Instant::now) + Duration::from_secs(UNLOCK_SECS);
+                let text = unlocked_text(&st.text, UNLOCK_SECS);
+                let mut keyboard = play_keyboard(&st, true);
                 if tg
-                    .edit(st.chat, st.msg, &text, Some(play_keyboard(&st, true)))
+                    .edit(st.chat, st.msg, &text, Some(keyboard.clone()))
                     .await
                     .is_err()
                 {
+                    keyboard = play_keyboard(&st, false);
                     let _ = tg
-                        .edit(st.chat, st.msg, &text, Some(play_keyboard(&st, false)))
+                        .edit(st.chat, st.msg, &text, Some(keyboard.clone()))
                         .await;
                 }
-                tokio::spawn(expire_task(
+                tokio::spawn(countdown_task(
                     tg.clone(),
                     streams.clone(),
                     id.to_string(),
                     st.chat,
                     st.msg,
                     st.text.clone(),
+                    keyboard,
+                    deadline,
                 ));
             }
             http_simple(&mut sock, 200, "OK", "application/json", b"{\"ok\":true}").await;
@@ -2341,5 +2406,14 @@ mod tests {
         // fails test 2: size unknown
         let unknown = serve_once("200 OK", "content-type: video/mp4\r\n", b"x").await;
         assert!(link_status(&http, &unknown, &[]).await.is_err());
+    }
+
+    #[test]
+    fn countdown_is_shown_as_hours_minutes_seconds() {
+        assert_eq!(fmt_hms(UNLOCK_SECS), "06:00:00");
+        assert_eq!(fmt_hms(7325), "02:02:05");
+        assert_eq!(fmt_hms(59), "00:00:59");
+        assert_eq!(fmt_hms(0), "00:00:00");
+        assert!(unlocked_text("x", 3661).contains("01:01:01"));
     }
 }
