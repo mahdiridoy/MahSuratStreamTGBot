@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 
 use moviebox_tui::providers::ReleaseProvider;
 use moviebox_tui::providers::models::{
-    CatalogItem, MediaDetails, MediaType, ProviderError, ProviderKind, Release, ResolutionIntent,
+    CatalogItem, Episode, MediaDetails, MediaType, ProviderError, ProviderKind, Release,
+    ResolutionIntent, Season,
 };
 use moviebox_tui::service::MovieBoxService;
 use serde_json::{Value, json};
@@ -127,6 +128,8 @@ struct ChatState {
     members: Vec<(ProviderKind, MediaDetails)>,
     /// Providers whose details failed to load: their stream ids are still used
     fallback: Vec<(ProviderKind, String)>,
+    /// Titles that are one season of a series
+    declared: Vec<Declared>,
     /// Details used for the card and the season / episode lists
     primary: Option<MediaDetails>,
     /// "Name (Year)" of the chosen title
@@ -147,6 +150,19 @@ struct Target {
     provider: ProviderKind,
     subject_id: String,
     siblings: Vec<String>,
+    /// Per-season titles use their own season number (usually 1)
+    season_override: Option<usize>,
+}
+
+/// A provider title that is exactly one season of a series ("Show S2").
+#[derive(Clone)]
+struct Declared {
+    provider: ProviderKind,
+    subject_id: String,
+    /// the season it stands for (2 in "Show S2")
+    season: usize,
+    /// the season number to send to the provider for this title
+    own_season: usize,
 }
 
 #[derive(Clone)]
@@ -288,6 +304,8 @@ struct Group {
 
 /// Lower-case title without bracketed text, punctuation or a leading "the".
 fn norm_title(s: &str) -> String {
+    let (base, _) = split_season(s);
+    let s = base.as_str();
     let mut out = String::new();
     let mut depth = 0u32;
     for c in s.chars() {
@@ -305,6 +323,35 @@ fn norm_title(s: &str) -> String {
         Some(rest) => rest.to_string(),
         None => joined,
     }
+}
+
+/// "Bachelor Point S2" / "Bachelor Point Season 2" -> ("Bachelor Point", Some(2)).
+/// MovieBox lists every season of some series as its own title.
+fn split_season(raw: &str) -> (String, Option<usize>) {
+    let cleaned = clean_title(raw);
+    let mut words: Vec<&str> = cleaned.split_whitespace().collect();
+    let mut season: Option<usize> = None;
+    if words.len() >= 2 {
+        let last = words[words.len() - 1];
+        let digits =
+            |d: &str| !d.is_empty() && d.len() <= 2 && d.chars().all(|c| c.is_ascii_digit());
+        if let Some(d) = last.strip_prefix(['s', 'S']).filter(|d| digits(d)) {
+            season = d.parse().ok().filter(|n| *n > 0);
+            if season.is_some() {
+                words.pop();
+            }
+        } else if words.len() >= 3
+            && words[words.len() - 2].eq_ignore_ascii_case("season")
+            && digits(last)
+        {
+            season = last.parse().ok().filter(|n| *n > 0);
+            if season.is_some() {
+                words.pop();
+                words.pop();
+            }
+        }
+    }
+    (words.join(" "), season)
 }
 
 /// Title for display: original case, bracketed text removed.
@@ -365,6 +412,9 @@ fn distinct_providers(members: &[(ProviderKind, CatalogItem)]) -> usize {
 fn build_groups(results: &[(ProviderKind, Vec<CatalogItem>)]) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
     let mut keys: Vec<(String, String)> = Vec::new();
+    // Groups that contain per-season titles ("Show S1", "Show S2", ...): their
+    // members have different release years, so the year is not compared.
+    let mut suffixed: Vec<bool> = Vec::new();
     // First the items that have a year, then the ones without (they join any
     // title with the same name).
     for with_year in [true, false] {
@@ -377,11 +427,17 @@ fn build_groups(results: &[(ProviderKind, Vec<CatalogItem>)]) -> Vec<Group> {
                 }
                 let series = it.media_type == MediaType::Series;
                 let poster = it.poster_url.clone().filter(|u| u.starts_with("http"));
-                let pos = keys
-                    .iter()
-                    .position(|(kt, ky)| *kt == nt && (y.is_empty() || years_close(ky, &y)));
+                let has_suffix = split_season(&it.title).1.is_some();
+                let pos = keys.iter().enumerate().position(|(i, (kt, ky))| {
+                    *kt == nt && (y.is_empty() || has_suffix || suffixed[i] || years_close(ky, &y))
+                });
                 match pos {
                     Some(i) => {
+                        suffixed[i] |= has_suffix;
+                        if has_suffix && !y.is_empty() && (keys[i].1.is_empty() || y < keys[i].1) {
+                            keys[i].1 = y.clone();
+                            groups[i].year = y.clone();
+                        }
                         let g = &mut groups[i];
                         let dup = g
                             .members
@@ -397,8 +453,9 @@ fn build_groups(results: &[(ProviderKind, Vec<CatalogItem>)]) -> Vec<Group> {
                     }
                     None => {
                         keys.push((nt, y.clone()));
+                        suffixed.push(has_suffix);
                         groups.push(Group {
-                            title: clean_title(&it.title),
+                            title: split_season(&it.title).0,
                             year: y,
                             series,
                             poster,
@@ -540,16 +597,15 @@ async fn expired(ctx: &Ctx, chat: i64) {
 
 // ---------------------------------------------------------------- Details
 
-fn card(d: &MediaDetails, providers: usize) -> String {
+fn card(d: &MediaDetails, found_on: &str) -> String {
     let mut s = format!("<b>{}</b>", esc(&d.title));
     if let Some(y) = d.year.as_ref().filter(|y| !y.is_empty()) {
         s.push_str(&format!(" ({})", esc(y)));
     }
     s.push_str(&format!(
-        "\n{} • {} provider{}",
+        "\n{} • On: {}",
         if d.is_series() { "Series" } else { "Movie" },
-        providers,
-        if providers == 1 { "" } else { "s" }
+        esc(found_on)
     ));
     if let Some(r) = d.imdb_rating.as_ref().filter(|r| !r.is_empty()) {
         s.push_str(&format!(" • ⭐ {}", esc(r)));
@@ -630,6 +686,11 @@ async fn open_group(ctx: &Ctx, chat: i64, gi: usize) {
         }
     }
 
+    let declared_by_id: std::collections::HashMap<String, usize> = group
+        .members
+        .iter()
+        .filter_map(|(_, it)| split_season(&it.title).1.map(|n| (it.id.value.clone(), n)))
+        .collect();
     let futs = group.members.iter().map(|(p, item)| {
         let svc = ctx.svc.clone();
         let p = *p;
@@ -642,11 +703,29 @@ async fn open_group(ctx: &Ctx, chat: i64, gi: usize) {
     let outs = futures::future::join_all(futs).await;
 
     let mut members: Vec<(ProviderKind, MediaDetails)> = Vec::new();
+    let mut declared: Vec<Declared> = Vec::new();
     let mut fallback: Vec<(ProviderKind, String)> = Vec::new();
     let mut first_err: Option<String> = None;
     for (p, id, r) in outs {
         match r {
-            Ok(Ok(d)) => members.push((p, d)),
+            Ok(Ok(d)) => {
+                if let Some(n) = declared_by_id.get(&id) {
+                    let own = if d.seasons.len() == 1 {
+                        d.seasons[0].number
+                    } else if d.seasons.iter().any(|s| s.number == *n) {
+                        *n
+                    } else {
+                        1
+                    };
+                    declared.push(Declared {
+                        provider: p,
+                        subject_id: d.id.value.clone(),
+                        season: *n,
+                        own_season: own,
+                    });
+                }
+                members.push((p, d));
+            }
             Ok(Err(e)) => {
                 eprintln!("[details] {} failed: {e:?}", p.label());
                 fallback.push((p, id));
@@ -682,18 +761,73 @@ async fn open_group(ctx: &Ctx, chat: i64, gi: usize) {
     } else {
         members.first()
     };
-    let Some(primary) = chosen.map(|(_, d)| d.clone()) else {
+    let Some(mut primary) = chosen.map(|(_, d)| d.clone()) else {
         expired(ctx, chat).await;
         return;
     };
 
-    let mut seen: Vec<ProviderKind> = Vec::new();
-    for (p, _) in &members {
-        if !seen.contains(p) {
-            seen.push(*p);
+    // MovieBox lists some series as one title per season. Show all those
+    // seasons in the season list (Season 1, 2, 3, ...).
+    if group.series && !declared.is_empty() {
+        let mut ordered = declared.clone();
+        ordered.sort_by_key(|d| d.season);
+        let mut merged: Vec<Season> = Vec::new();
+        for dd in &ordered {
+            if merged.iter().any(|s| s.number == dd.season) {
+                continue;
+            }
+            let Some((_, det)) = members
+                .iter()
+                .find(|(mp, md)| *mp == dd.provider && md.id.value == dd.subject_id)
+            else {
+                continue;
+            };
+            let eps: Vec<Episode> = det
+                .seasons
+                .iter()
+                .find(|s| s.number == dd.own_season)
+                .or(det.seasons.first())
+                .map(|s| {
+                    s.episodes
+                        .iter()
+                        .map(|e| Episode {
+                            season: dd.season,
+                            ..e.clone()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !eps.is_empty() {
+                merged.push(Season {
+                    number: dd.season,
+                    episodes: eps,
+                });
+            }
+        }
+        let other = members
+            .iter()
+            .filter(|(p, d)| {
+                !declared
+                    .iter()
+                    .any(|x| x.provider == *p && x.subject_id == d.id.value)
+            })
+            .map(|(_, d)| d)
+            .find(|d| !d.seasons.is_empty());
+        let other_count = other.map_or(0, |d| d.seasons.len());
+        if merged.len() > other_count {
+            primary.seasons = merged;
+        } else if let Some(o) = other {
+            primary.seasons = o.seasons.clone();
         }
     }
-    let caption = card(&primary, seen.len());
+
+    let mut names: Vec<&str> = Vec::new();
+    for (p, _) in &group.members {
+        if !names.contains(&p.label()) {
+            names.push(p.label());
+        }
+    }
+    let caption = card(&primary, &names.join(", "));
     let ok_url = |u: &String| u.starts_with("http");
     let poster = primary
         .poster_url
@@ -719,6 +853,7 @@ async fn open_group(ctx: &Ctx, chat: i64, gi: usize) {
     let p2 = primary.clone();
     st_set(ctx, chat, |s| {
         s.members = members;
+        s.declared = declared;
         s.fallback = fallback;
         s.primary = Some(p2);
         s.title = title;
@@ -887,6 +1022,16 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
     // One target per provider subject (MovieBox has one subject per audio dub).
     let mut targets: Vec<Target> = Vec::new();
     for (p, d) in &st.members {
+        // A per-season title only answers for its own season.
+        let decl = st
+            .declared
+            .iter()
+            .find(|x| x.provider == *p && x.subject_id == d.id.value);
+        let season_override = match decl {
+            Some(x) if x.season != st.season => continue,
+            Some(x) => Some(x.own_season),
+            None => None,
+        };
         let mut ids: Vec<String> = Vec::new();
         if *p == ProviderKind::MovieBox {
             ids.extend(d.dubs.iter().map(|x| x.subject_id.clone()));
@@ -905,6 +1050,7 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
                 provider: *p,
                 subject_id: id,
                 siblings: siblings.clone(),
+                season_override,
             });
         }
     }
@@ -920,6 +1066,7 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
                 provider: *p,
                 subject_id: id.clone(),
                 siblings: Vec::new(),
+                season_override: None,
             });
         }
     }
@@ -928,7 +1075,7 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
         let svc = ctx.svc.clone();
         let p = t.provider;
         let id = t.subject_id.clone();
-        let (season, episode) = (st.season, st.episode);
+        let (season, episode) = (t.season_override.unwrap_or(st.season), st.episode);
         async move {
             let r = tokio::time::timeout(
                 Duration::from_secs(45),
@@ -944,12 +1091,20 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
     let mut errs: Vec<String> = Vec::new();
     for (ti, p, r) in outs {
         match r {
-            Ok(Ok(v)) => tagged.extend(v.into_iter().map(|x| (x, ti))),
-            Ok(Err(ProviderError::NotFound)) => {}
+            Ok(Ok(v)) => {
+                if v.is_empty() {
+                    errs.push(format!("{}: no streams", p.label()));
+                }
+                tagged.extend(v.into_iter().map(|x| (x, ti)));
+            }
+            Ok(Err(ProviderError::NotFound)) => {
+                errs.push(format!("{}: no streams found", p.label()))
+            }
             Ok(Err(e)) => errs.push(e.user_message(p)),
             Err(_) => errs.push(format!("{} timed out.", p.label())),
         }
     }
+    let found_before_check = tagged.len();
     // Hide dead links (404, error pages, ...). 4KHDHub pages are resolved and
     // checked later, when the quality is tapped.
     {
@@ -991,9 +1146,23 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
     }
     if tagged.is_empty() {
         let mut text = "⚠️ No streams found for this item.".to_string();
+        if found_before_check > 0 {
+            errs.push(format!(
+                "{found_before_check} link(s) found, but none passed the check (HTTP 200 and over 50 MB)"
+            ));
+        }
         errs.dedup();
-        for e in errs.iter().take(3) {
-            text.push_str(&format!("\n• {}", esc(&short(e, 120))));
+        for e in errs.iter().take(8) {
+            text.push_str(&format!("\n• {}", esc(&short(e, 140))));
+        }
+        let asked: Vec<ProviderKind> = targets.iter().map(|t| t.provider).collect();
+        let absent: Vec<&str> = BOT_PROVIDERS
+            .iter()
+            .filter(|p| !p.is_bdix() && !asked.contains(p))
+            .map(|p| p.label())
+            .collect();
+        if !absent.is_empty() {
+            text.push_str(&format!("\n• Title not found on: {}", absent.join(", ")));
         }
         show(ctx, chat, target_msg, &text, None).await;
         return;
@@ -1050,6 +1219,15 @@ fn probe_client() -> &'static reqwest::Client {
     })
 }
 
+/// HLS stream (playlist), which has no file size and cannot be saved as one file.
+fn is_hls(url: &str) -> bool {
+    url.split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .ends_with(".m3u8")
+}
+
 fn host_of(url: &str) -> &str {
     url.split("://")
         .nth(1)
@@ -1086,6 +1264,34 @@ async fn link_status(
     let status = resp.status().as_u16();
     if status != 200 && status != 206 {
         return Err(format!("HTTP {status}"));
+    }
+
+    // HLS playlists (.m3u8) are small text files: accept them when the body
+    // really is a playlist.
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if is_hls(url) || ct.contains("mpegurl") {
+        let mut resp = resp;
+        let head = tokio::time::timeout(Duration::from_secs(8), resp.chunk())
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+            .flatten()
+            .unwrap_or_default();
+        let text = String::from_utf8_lossy(&head);
+        return if text
+            .trim_start_matches('\u{feff}')
+            .trim_start()
+            .starts_with("#EXTM3U")
+        {
+            Ok(())
+        } else {
+            Err("the HLS playlist is empty or invalid".to_string())
+        };
     }
 
     // Test 2: size greater than 50 MB
@@ -1259,8 +1465,13 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
         if let (Some(rid), Some(t)) = (rel.resource_id.as_ref(), tgt.as_ref()) {
             let caps = tokio::time::timeout(
                 Duration::from_secs(15),
-                ctx.svc
-                    .get_ext_captions(&t.subject_id, rid, &t.siblings, st.season, st.episode),
+                ctx.svc.get_ext_captions(
+                    &t.subject_id,
+                    rid,
+                    &t.siblings,
+                    t.season_override.unwrap_or(st.season),
+                    st.episode,
+                ),
             )
             .await;
             if let Ok(Ok(list)) = caps {
@@ -1611,9 +1822,11 @@ fn play_keyboard(st: &Stream, webapp: bool) -> Value {
             json!({"text": "📱 MX Player", "url": format!("{page}&go=mx")}),
             json!({"text": "🎞 VLC", "url": format!("{page}&go=vlc")}),
         ]);
-        rows.push(vec![
-            json!({"text": "⬇️ Download", "url": dl_url(&st.page, i)}),
-        ]);
+        if !is_hls(&it.url) {
+            rows.push(vec![
+                json!({"text": "⬇️ Download", "url": dl_url(&st.page, i)}),
+            ]);
+        }
     }
     rows.push(vec![cb("⬅ Other qualities", "q".to_string())]);
     kb(rows)
@@ -2206,6 +2419,38 @@ fn write_config(token: &str, allow: &str) {
     }
 }
 
+/// Free hosts (Render) fall asleep after a few idle minutes and then need up to
+/// a minute to wake up. Ping the sleepy built-in addons now and every 10 minutes.
+fn spawn_keep_warm() {
+    let urls: Vec<&'static str> = moviebox_tui::providers::addons::BUILTIN_ADDON_MANIFESTS
+        .iter()
+        .map(|(_, url)| *url)
+        .filter(|url| moviebox_tui::providers::addons::is_slow_host(url))
+        .collect();
+    if urls.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            for url in &urls {
+                let r =
+                    tokio::time::timeout(Duration::from_secs(90), probe_client().get(*url).send())
+                        .await;
+                eprintln!(
+                    "[warm] {} -> {}",
+                    host_of(url),
+                    if matches!(r, Ok(Ok(_))) {
+                        "awake"
+                    } else {
+                        "no answer"
+                    }
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(600)).await;
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -2291,6 +2536,7 @@ async fn main() {
     match tokio::net::TcpListener::bind("127.0.0.1:0").await {
         Ok(listener) => {
             let port = listener.local_addr().map(|a| a.port()).unwrap_or(8787);
+            spawn_keep_warm();
             tokio::spawn(server_task(listener, ctx.streams.clone(), ctx.tg.clone()));
             tokio::spawn(tunnel_task(ctx.base.clone(), port));
         }
@@ -2554,5 +2800,78 @@ mod tests {
         let groups = build_groups(&results);
         assert_eq!(groups.len(), 1);
         assert_eq!(distinct_providers(&groups[0].members), 2);
+    }
+
+    #[test]
+    fn per_season_titles_are_split_and_grouped() {
+        assert_eq!(
+            split_season("Bachelor Point S2"),
+            ("Bachelor Point".to_string(), Some(2))
+        );
+        assert_eq!(
+            split_season("Bachelor Point [Bengali] Season 3"),
+            ("Bachelor Point".to_string(), Some(3))
+        );
+        assert_eq!(split_season("Iron Man 2"), ("Iron Man 2".to_string(), None));
+        assert_eq!(split_season("Se7en"), ("Se7en".to_string(), None));
+        assert_eq!(split_season("S1"), ("S1".to_string(), None));
+
+        let mut s1 = item(
+            ProviderKind::MovieBox,
+            "1",
+            "Bachelor Point S1",
+            Some("2018"),
+        );
+        let mut s2 = item(
+            ProviderKind::MovieBox,
+            "2",
+            "Bachelor Point S2",
+            Some("2019"),
+        );
+        let mut s5 = item(
+            ProviderKind::MovieBox,
+            "5",
+            "Bachelor Point S5",
+            Some("2025"),
+        );
+        let mut cine = item(
+            ProviderKind::Addons,
+            "series:tt1",
+            "Bachelor Point",
+            Some("2018"),
+        );
+        for it in [&mut s1, &mut s2, &mut s5, &mut cine] {
+            it.media_type = MediaType::Series;
+        }
+        let results = vec![
+            (ProviderKind::MovieBox, vec![s5, s1, s2]),
+            (ProviderKind::Addons, vec![cine]),
+        ];
+        let groups = build_groups(&results);
+        assert_eq!(groups.len(), 1, "all seasons end up in one title");
+        assert_eq!(groups[0].title, "Bachelor Point");
+        assert_eq!(groups[0].year, "2018");
+        assert_eq!(groups[0].members.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn hls_playlists_pass_when_valid() {
+        let http = reqwest::Client::new();
+        let good = serve_once(
+            "200 OK",
+            "content-type: application/vnd.apple.mpegurl\r\n",
+            b"#EXTM3U\n#EXT-X-VERSION:3\n",
+        )
+        .await;
+        assert!(link_status(&http, &good, &[]).await.is_ok());
+        let bad = serve_once(
+            "200 OK",
+            "content-type: application/vnd.apple.mpegurl\r\n",
+            b"<html>oops</html>",
+        )
+        .await;
+        assert!(link_status(&http, &bad, &[]).await.is_err());
+        assert!(is_hls("https://cdn.example.com/x/master.m3u8?token=1"));
+        assert!(!is_hls("https://cdn.example.com/x/movie.mkv"));
     }
 }
