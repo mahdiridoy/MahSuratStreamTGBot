@@ -1240,16 +1240,48 @@ fn host_of(url: &str) -> &str {
 /// A link is only shown when it passes both tests.
 const MIN_LINK_BYTES: u64 = 50 * 1024 * 1024;
 
+/// First bytes of a playlist-like answer (no Range header).
+async fn fetch_head(
+    http: &reqwest::Client,
+    url: &str,
+    headers: &[(String, String)],
+) -> Option<String> {
+    let mut req = http.get(url);
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let mut resp = tokio::time::timeout(Duration::from_secs(10), req.send())
+        .await
+        .ok()?
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let chunk = tokio::time::timeout(Duration::from_secs(8), resp.chunk())
+        .await
+        .ok()?
+        .ok()??;
+    Some(String::from_utf8_lossy(&chunk).to_string())
+}
+
+fn is_playlist_text(text: &str) -> bool {
+    text.trim_start_matches('\u{feff}')
+        .trim_start()
+        .starts_with("#EXTM3U")
+}
+
 /// Two tests before a link is sent to the user:
 /// 1. the link answers HTTP 200 (206 when the host honours our Range request)
 /// 2. the file is bigger than 50 MB
 ///
+/// HLS streams (playlists of small pieces) have no single file size, so they
+/// pass when the playlist is valid. Ok(true) means HLS, Ok(false) a plain file.
 /// Err(reason) means the link is hidden.
 async fn link_status(
     http: &reqwest::Client,
     url: &str,
     headers: &[(String, String)],
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let mut req = http.get(url).header("Range", "bytes=0-1");
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str());
@@ -1266,41 +1298,12 @@ async fn link_status(
         return Err(format!("HTTP {status}"));
     }
 
-    // HLS playlists (.m3u8) are small text files: accept them when the body
-    // really is a playlist.
     let ct = resp
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if is_hls(url) || ct.contains("mpegurl") {
-        let mut resp = resp;
-        let head = tokio::time::timeout(Duration::from_secs(8), resp.chunk())
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .flatten()
-            .unwrap_or_default();
-        let text = String::from_utf8_lossy(&head);
-        return if text
-            .trim_start_matches('\u{feff}')
-            .trim_start()
-            .starts_with("#EXTM3U")
-        {
-            Ok(())
-        } else {
-            Err("the HLS playlist is empty or invalid".to_string())
-        };
-    }
-
-    // Test 2: size greater than 50 MB
-    let header_num = |name: &str| -> Option<u64> {
-        resp.headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    };
     let total = if status == 206 {
         resp.headers()
             .get("content-range")
@@ -1308,10 +1311,30 @@ async fn link_status(
             .and_then(|v| v.rsplit('/').next())
             .and_then(|v| v.trim().parse::<u64>().ok())
     } else {
-        header_num("content-length")
+        resp.headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
     };
+
+    // HLS: a small answer that is really a playlist.
+    let hint = is_hls(url) || ct.contains("mpegurl");
+    if hint || total.is_some_and(|t| t < 2 * 1024 * 1024) {
+        drop(resp);
+        if fetch_head(http, url, headers)
+            .await
+            .is_some_and(|t| is_playlist_text(&t))
+        {
+            return Ok(true);
+        }
+        if hint {
+            return Err("the HLS playlist is empty or invalid".to_string());
+        }
+    }
+
+    // Test 2: size greater than 50 MB
     match total {
-        Some(t) if t > MIN_LINK_BYTES => Ok(()),
+        Some(t) if t > MIN_LINK_BYTES => Ok(false),
         Some(t) => Err(format!("file is only {} MB", t / (1024 * 1024))),
         None => Err("file size unknown".to_string()),
     }
@@ -1386,10 +1409,10 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
     )
     .await;
     let mut reason: Option<String> = None;
-    let mut alive: Vec<LinkEntry> = Vec::new();
+    let mut alive: Vec<(LinkEntry, bool)> = Vec::new();
     for (l, c) in links.into_iter().zip(checks) {
         match c {
-            Ok(()) => alive.push(l),
+            Ok(hls) => alive.push((l, hls)),
             Err(e) => {
                 if reason.is_none() {
                     reason = Some(format!("{e} on {}", host_of(&l.1)));
@@ -1445,7 +1468,7 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
         return;
     };
     let mut items: Vec<StreamItem> = Vec::new();
-    for (i, (label, url, headers)) in links.iter().enumerate() {
+    for (i, ((label, url, headers), hls)) in links.iter().enumerate() {
         let name = if label.trim().is_empty() {
             format!("Link {}", i + 1)
         } else {
@@ -1456,6 +1479,7 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
             name,
             url: url.clone(),
             headers: headers.clone(),
+            hls: *hls,
         });
     }
     text.push('\n');
@@ -1692,6 +1716,8 @@ struct StreamItem {
     name: String,
     url: String,
     headers: Vec<(String, String)>,
+    /// HLS stream (playlist of small pieces)
+    hls: bool,
 }
 
 #[derive(Clone)]
@@ -1822,11 +1848,9 @@ fn play_keyboard(st: &Stream, webapp: bool) -> Value {
             json!({"text": "📱 MX Player", "url": format!("{page}&go=mx")}),
             json!({"text": "🎞 VLC", "url": format!("{page}&go=vlc")}),
         ]);
-        if !is_hls(&it.url) {
-            rows.push(vec![
-                json!({"text": "⬇️ Download", "url": dl_url(&st.page, i)}),
-            ]);
-        }
+        rows.push(vec![
+            json!({"text": "⬇️ Download", "url": dl_url(&st.page, i)}),
+        ]);
     }
     rows.push(vec![cb("⬅ Other qualities", "q".to_string())]);
     kb(rows)
@@ -1915,6 +1939,7 @@ const PLAYER_HTML: &str = r##"<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>__TITLE__</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
+__HLS_SCRIPT__
 <style>
 html,body{margin:0;background:#0f0f14;color:#eee;font-family:system-ui,sans-serif}
 h1{font-size:16px;margin:12px;font-weight:600}
@@ -1932,7 +1957,7 @@ body.fs video{width:100vw;height:100vh;max-height:none;object-fit:contain}
 </style></head><body>
 <h1>__TITLE__</h1>
 <div id="wrap">
-<video id="v" controls controlslist="nofullscreen" autoplay playsinline webkit-playsinline src="/s/__ID__?n=__N__"></video>
+<video id="v" controls controlslist="nofullscreen" autoplay playsinline webkit-playsinline></video>
 <button id="fs" type="button">&#x26F6;</button>
 </div>
 <div class="row"><a class="b" id="mx" href="#">MX Player</a><a class="b v" id="vlc" href="#">VLC</a><a class="b d" id="dl" href="#">Download</a></div>
@@ -1952,6 +1977,9 @@ function launch(k){
 document.getElementById("mx").onclick=function(e){e.preventDefault();launch("mx");};
 document.getElementById("vlc").onclick=function(e){e.preventDefault();launch("vlc");};
 document.getElementById("dl").onclick=function(e){e.preventDefault();var u=location.origin+"/d/__ID__?n=__N__";if(inTg&&tg.openLink){tg.openLink(u);}else{location.href=u;}};
+var SRC="/s/__ID__?n=__N__",HLS=__HLS__,vid=document.getElementById("v");
+if(HLS&&window.Hls&&Hls.isSupported()){var hl=new Hls();hl.loadSource(SRC);hl.attachMedia(vid);hl.on(Hls.Events.ERROR,function(e,d){if(d&&d.fatal){document.getElementById("msg").textContent="This stream cannot play in-app. Tap MX Player or VLC above.";}});}
+else{vid.src=SRC;}
 document.getElementById("v").addEventListener("error",function(){document.getElementById("msg").textContent="This video format cannot play in-app. Tap MX Player or VLC above.";});
 /* Fullscreen: Telegram's webview blocks the native button, so use our own. */
 var wrap=document.getElementById("wrap");
@@ -2022,7 +2050,7 @@ fn js_str(s: &str) -> String {
         .replace("</", "<\\/")
 }
 
-fn player_page(id: &str, title: &str, go: &str, n: usize) -> String {
+fn player_page(id: &str, title: &str, go: &str, n: usize, hls: bool) -> String {
     let go = if go == "mx" || go == "vlc" { go } else { "" };
     PLAYER_HTML
         .replace("__TITLE_JS__", &js_str(title))
@@ -2030,6 +2058,15 @@ fn player_page(id: &str, title: &str, go: &str, n: usize) -> String {
         .replace("__ID__", id)
         .replace("__N__", &n.to_string())
         .replace("__GO__", go)
+        .replace(
+            "__HLS_SCRIPT__",
+            if hls {
+                r#"<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>"#
+            } else {
+                ""
+            },
+        )
+        .replace("__HLS__", if hls { "true" } else { "false" })
 }
 
 fn gate_page(id: &str, title: &str) -> String {
@@ -2170,7 +2207,8 @@ async fn serve_conn(
                 .split('&')
                 .find_map(|kv| kv.strip_prefix("go="))
                 .unwrap_or("");
-            player_page(id, &entry.title, go, n)
+            let hls = entry.items.get(n).is_some_and(|i| i.hls);
+            player_page(id, &entry.title, go, n, hls)
         } else {
             gate_page(id, &entry.title)
         };
@@ -2187,9 +2225,11 @@ async fn serve_conn(
 
     let route = path
         .strip_prefix("/s/")
-        .map(|id| (id, false))
-        .or_else(|| path.strip_prefix("/d/").map(|id| (id, true)));
-    if let Some((id, download)) = route {
+        .map(|id| (id, 's'))
+        .or_else(|| path.strip_prefix("/d/").map(|id| (id, 'd')))
+        .or_else(|| path.strip_prefix("/h/").map(|id| (id, 'h')));
+    if let Some((id, mode)) = route {
+        let download = mode == 'd';
         let Some(entry) = get(id) else {
             http_simple(&mut sock, 404, "Not Found", "text/plain", b"Expired").await;
             return;
@@ -2209,7 +2249,32 @@ async fn serve_conn(
             http_simple(&mut sock, 404, "Not Found", "text/plain", b"No such source").await;
             return;
         };
-        let mut req = http.get(&item.url);
+        // Whole HLS stream as one file: join the pieces.
+        if download && item.hls {
+            hls_download(&mut sock, &http, &item, &entry.file_base).await;
+            return;
+        }
+        // /h/ = a playlist or piece of an HLS stream (address in "u=")
+        let target_url = if mode == 'h' {
+            let decoded = query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("u="))
+                .and_then(|v| {
+                    use base64::Engine;
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(v.as_bytes())
+                        .ok()
+                })
+                .and_then(|b| String::from_utf8(b).ok());
+            let Some(u) = decoded else {
+                http_simple(&mut sock, 400, "Bad Request", "text/plain", b"bad address").await;
+                return;
+            };
+            u
+        } else {
+            item.url.clone()
+        };
+        let mut req = http.get(&target_url);
         for (hn, hv) in &item.headers {
             req = req.header(hn.as_str(), hv.as_str());
         }
@@ -2232,11 +2297,40 @@ async fn serve_conn(
             }
         };
         let status = resp.status();
+        let up_ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        // A playlist: point every piece to this server so players can load it.
+        if status.is_success()
+            && mode != 'd'
+            && ((mode == 's' && item.hls) || is_hls(&target_url) || up_ct.contains("mpegurl"))
+        {
+            let base_url = resp.url().clone();
+            let body = resp.text().await.unwrap_or_default();
+            if is_playlist_text(&body) {
+                let out_body = rewrite_playlist(&body, &base_url, id, n);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/vnd.apple.mpegurl\r\ncontent-length: {}\r\naccess-control-allow-origin: *\r\nconnection: close\r\n\r\n",
+                    out_body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                if method != "HEAD" {
+                    let _ = sock.write_all(out_body.as_bytes()).await;
+                }
+                let _ = sock.flush().await;
+                return;
+            }
+            http_simple(&mut sock, 502, "Bad Gateway", "text/plain", b"bad playlist").await;
+            return;
+        }
         if status.as_u16() >= 400 {
             eprintln!(
                 "[proxy] upstream HTTP {} for {}",
                 status.as_u16(),
-                host_of(&item.url)
+                host_of(&target_url)
             );
         }
         let mut out = format!(
@@ -2266,7 +2360,7 @@ async fn serve_conn(
             out.push_str("content-type: video/mp4\r\n");
         }
         if download {
-            let fname = download_name(&entry.file_base, file_ext(&item.url, &ctype));
+            let fname = download_name(&entry.file_base, file_ext(&target_url, &ctype));
             out.push_str(&format!(
                 "content-disposition: attachment; filename=\"{fname}\"\r\n"
             ));
@@ -2295,6 +2389,223 @@ async fn serve_conn(
         b"MahSurat Stream Bot player server",
     )
     .await;
+}
+
+// ------------------------------------------------------------- HLS streams
+
+fn proxy_url(id: &str, n: usize, target: &str) -> String {
+    use base64::Engine;
+    format!(
+        "/h/{id}?n={n}&u={}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(target.as_bytes())
+    )
+}
+
+/// Rewrite `URI="..."` values inside a playlist tag line.
+fn rewrite_uri_attrs(line: &str, f: &dyn Fn(&str) -> String) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(i) = rest.find("URI=\"") {
+        let start = i + 5;
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        match after.find('"') {
+            Some(end) => {
+                out.push_str(&f(&after[..end]));
+                rest = &after[end..];
+            }
+            None => {
+                rest = after;
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Every address in the playlist becomes a link to this server (which adds the
+/// headers the file host needs).
+fn rewrite_playlist(text: &str, base: &url::Url, id: &str, n: usize) -> String {
+    let conv = |r: &str| -> String {
+        match base.join(r) {
+            Ok(u) => proxy_url(id, n, u.as_str()),
+            Err(_) => r.to_string(),
+        }
+    };
+    let mut out = String::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            out.push('\n');
+        } else if t.starts_with('#') {
+            out.push_str(&rewrite_uri_attrs(t, &conv));
+            out.push('\n');
+        } else {
+            out.push_str(&conv(t));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+async fn get_text(
+    http: &reqwest::Client,
+    url: &str,
+    headers: &[(String, String)],
+) -> Option<(String, url::Url)> {
+    let mut req = http.get(url);
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let resp = tokio::time::timeout(Duration::from_secs(20), req.send())
+        .await
+        .ok()?
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let base = resp.url().clone();
+    let text = resp.text().await.ok()?;
+    is_playlist_text(&text).then_some((text, base))
+}
+
+/// Pieces of an HLS media playlist: (optional init piece, pieces, encrypted)
+fn parse_media_playlist(text: &str, base: &url::Url) -> (Option<String>, Vec<String>, bool) {
+    let mut map: Option<String> = None;
+    let mut segs: Vec<String> = Vec::new();
+    let mut encrypted = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if let Some(attrs) = t.strip_prefix("#EXT-X-KEY:") {
+            if !attrs.contains("METHOD=NONE") {
+                encrypted = true;
+            }
+        } else if let Some(attrs) = t.strip_prefix("#EXT-X-MAP:") {
+            if let Some(i) = attrs.find("URI=\"") {
+                let rest = &attrs[i + 5..];
+                if let Some(end) = rest.find('"') {
+                    if let Ok(u) = base.join(&rest[..end]) {
+                        map = Some(u.to_string());
+                    }
+                }
+            }
+        } else if !t.is_empty() && !t.starts_with('#') {
+            if let Ok(u) = base.join(t) {
+                segs.push(u.to_string());
+            }
+        }
+    }
+    (map, segs, encrypted)
+}
+
+/// Download an HLS stream as one file: the pieces are fetched one after the
+/// other and sent as a single .ts (or .mp4) download.
+async fn hls_download(
+    sock: &mut tokio::net::TcpStream,
+    http: &reqwest::Client,
+    item: &StreamItem,
+    file_base: &str,
+) {
+    use tokio::io::AsyncWriteExt;
+    let Some((mut text, mut base)) = get_text(http, &item.url, &item.headers).await else {
+        http_simple(sock, 502, "Bad Gateway", "text/plain", b"playlist error").await;
+        return;
+    };
+    // Master playlist: take the best quality.
+    if text.contains("#EXT-X-STREAM-INF") {
+        let mut best: Option<(u64, String)> = None;
+        let mut pending: Option<u64> = None;
+        for line in text.lines() {
+            let t = line.trim();
+            if let Some(attrs) = t.strip_prefix("#EXT-X-STREAM-INF:") {
+                pending = attrs
+                    .split(',')
+                    .find_map(|kv| kv.trim().strip_prefix("BANDWIDTH="))
+                    .and_then(|v| v.parse().ok());
+            } else if !t.is_empty() && !t.starts_with('#') {
+                let bw = pending.take().unwrap_or(0);
+                if best.as_ref().is_none_or(|(b, _)| bw > *b) {
+                    best = Some((bw, t.to_string()));
+                }
+            }
+        }
+        let next = best.and_then(|(_, rel)| base.join(&rel).ok());
+        let Some(next) = next else {
+            http_simple(sock, 502, "Bad Gateway", "text/plain", b"no variant").await;
+            return;
+        };
+        let Some((t2, b2)) = get_text(http, next.as_str(), &item.headers).await else {
+            http_simple(sock, 502, "Bad Gateway", "text/plain", b"playlist error").await;
+            return;
+        };
+        text = t2;
+        base = b2;
+    }
+    let (map, segs, encrypted) = parse_media_playlist(&text, &base);
+    if encrypted {
+        http_simple(
+            sock,
+            501,
+            "Not Implemented",
+            "text/plain",
+            b"This stream is encrypted and cannot be downloaded. Use Play instead.",
+        )
+        .await;
+        return;
+    }
+    if segs.is_empty() {
+        http_simple(sock, 502, "Bad Gateway", "text/plain", b"empty playlist").await;
+        return;
+    }
+    let fmp4 = map.is_some()
+        || segs[0]
+            .split(['?', '#'])
+            .next()
+            .is_some_and(|p| p.ends_with(".m4s") || p.ends_with(".mp4"));
+    let (ext, ctype) = if fmp4 {
+        ("mp4", "video/mp4")
+    } else {
+        ("ts", "video/mp2t")
+    };
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: {ctype}\r\ncontent-disposition: attachment; filename=\"{}\"\r\ntransfer-encoding: chunked\r\naccess-control-allow-origin: *\r\nconnection: close\r\n\r\n",
+        download_name(file_base, ext)
+    );
+    if sock.write_all(head.as_bytes()).await.is_err() {
+        return;
+    }
+    for url in map.iter().chain(segs.iter()) {
+        let mut data: Option<Vec<u8>> = None;
+        for _ in 0..3 {
+            let mut req = http.get(url);
+            for (k, v) in &item.headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            if let Ok(Ok(r)) = tokio::time::timeout(Duration::from_secs(40), req.send()).await {
+                if r.status().is_success() {
+                    if let Ok(b) = r.bytes().await {
+                        data = Some(b.to_vec());
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let Some(data) = data else {
+            eprintln!("[hls] piece failed on {}", host_of(url));
+            return; // cut the connection: the download shows as failed
+        };
+        let size = format!("{:x}\r\n", data.len());
+        if sock.write_all(size.as_bytes()).await.is_err()
+            || sock.write_all(&data).await.is_err()
+            || sock.write_all(b"\r\n").await.is_err()
+        {
+            return;
+        }
+    }
+    let _ = sock.write_all(b"0\r\n\r\n").await;
+    let _ = sock.flush().await;
 }
 
 async fn server_task(listener: tokio::net::TcpListener, streams: StreamMap, tg: Tg) {
@@ -2702,13 +3013,16 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            if let Ok((mut sock, _)) = listener.accept().await {
-                let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf).await;
-                let head = format!("HTTP/1.1 {status_line}\r\n{headers}connection: close\r\n\r\n");
-                let _ = sock.write_all(head.as_bytes()).await;
-                let _ = sock.write_all(body).await;
-                let _ = sock.shutdown().await;
+            for _ in 0..4 {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let head =
+                        format!("HTTP/1.1 {status_line}\r\n{headers}connection: close\r\n\r\n");
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    let _ = sock.shutdown().await;
+                }
             }
         });
         format!("http://{addr}/file.mkv")
@@ -2873,5 +3187,138 @@ mod tests {
         assert!(link_status(&http, &bad, &[]).await.is_err());
         assert!(is_hls("https://cdn.example.com/x/master.m3u8?token=1"));
         assert!(!is_hls("https://cdn.example.com/x/movie.mkv"));
+    }
+
+    #[test]
+    fn hls_playlists_point_back_to_this_server() {
+        let base = url::Url::parse("https://cdn.example.com/a/b/index.m3u8?x=1").unwrap();
+        let text = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"https://k.example.com/key\"\n#EXTINF:4,\nseg1.ts\n/abs/seg2.ts\n";
+        let out = rewrite_playlist(text, &base, "abc", 2);
+        assert!(out.starts_with("#EXTM3U\n"));
+        assert!(out.lines().all(|l| !l.contains("cdn.example.com")));
+        assert_eq!(out.matches("/h/abc?n=2&u=").count(), 4);
+        // the original address can be recovered
+        use base64::Engine;
+        let enc = out
+            .lines()
+            .find(|l| l.starts_with("/h/abc?n=2&u="))
+            .unwrap()
+            .trim_start_matches("/h/abc?n=2&u=");
+        let back = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(enc)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(back).unwrap(),
+            "https://cdn.example.com/a/b/seg1.ts"
+        );
+        let (map, segs, enc_on) = parse_media_playlist(text, &base);
+        assert_eq!(map.as_deref(), Some("https://cdn.example.com/a/b/init.mp4"));
+        assert_eq!(segs.len(), 2);
+        assert!(enc_on);
+    }
+
+    /// A tiny HLS "CDN": a playlist (relative pieces) and two pieces.
+    async fn spawn_fake_cdn() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    continue;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let (ct, body): (&str, &[u8]) = match path.as_str() {
+                        "/v/index.m3u8" => (
+                            "application/vnd.apple.mpegurl",
+                            b"#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4,\nseg0.ts\n#EXTINF:4,\nseg1.ts\n#EXT-X-ENDLIST\n",
+                        ),
+                        "/v/seg0.ts" => ("video/mp2t", b"AAAA"),
+                        "/v/seg1.ts" => ("video/mp2t", b"BBBB"),
+                        _ => ("text/plain", b"nope"),
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {ct}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}/v/index.m3u8")
+    }
+
+    #[tokio::test]
+    async fn hls_stream_plays_and_downloads_through_the_bot_server() {
+        let cdn_playlist = spawn_fake_cdn().await;
+        let http = reqwest::Client::new();
+
+        // the bot's player server
+        let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
+        streams.lock().unwrap().insert(
+            "abc".to_string(),
+            Stream {
+                items: vec![StreamItem {
+                    name: "HLS".to_string(),
+                    url: cdn_playlist,
+                    headers: Vec::new(),
+                    hls: true,
+                }],
+                title: "Show".to_string(),
+                file_base: "Show S01E01 1080p".to_string(),
+                chat: 0,
+                msg: 0,
+                text: String::new(),
+                page: "http://x/p/abc".to_string(),
+                unlocked_at: Some(Instant::now()),
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bot = listener.local_addr().unwrap();
+        tokio::spawn(server_task(listener, streams, Tg::new("test")));
+
+        // play: the playlist now points to the bot server
+        let pl = http
+            .get(format!("http://{bot}/s/abc?n=0"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pl.status(), 200);
+        let pl_text = pl.text().await.unwrap();
+        assert!(pl_text.starts_with("#EXTM3U"));
+        assert!(!pl_text.contains("127.0.0.1"));
+        let first_piece = pl_text
+            .lines()
+            .find(|l| l.starts_with("/h/abc?n=0&u="))
+            .expect("rewritten piece address");
+        let piece = http
+            .get(format!("http://{bot}{first_piece}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(piece.bytes().await.unwrap().as_ref(), b"AAAA");
+
+        // download: all pieces joined into one file
+        let dl = http
+            .get(format!("http://{bot}/d/abc?n=0"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(dl.status(), 200);
+        let disp = dl
+            .headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(disp.contains("Show S01E01 1080p.ts"), "{disp}");
+        assert_eq!(dl.bytes().await.unwrap().as_ref(), b"AAAABBBB");
     }
 }
