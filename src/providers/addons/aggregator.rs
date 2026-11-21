@@ -18,16 +18,23 @@ pub async fn aggregate_streams(
     episode: usize,
     is_series: bool,
 ) -> (Vec<Release>, Vec<String>) {
+    let clean_id = clean_addon_subject_id(subject_id);
+    // Only ask the addons that understand this kind of id (tt..., bpx-..., ...).
     let stream_addons: Vec<&InstalledAddon> = addons
         .iter()
         .filter(|a| a.enabled && a.provides_stream)
+        .filter(|a| {
+            a.id_prefixes.is_empty()
+                || a.id_prefixes
+                    .iter()
+                    .any(|p| !p.is_empty() && clean_id.starts_with(p.as_str()))
+        })
         .collect();
 
     if stream_addons.is_empty() {
         return (Vec::new(), Vec::new());
     }
 
-    let clean_id = clean_addon_subject_id(subject_id);
     let media_type = if is_series { "series" } else { "movie" };
     let stream_id = if is_series && episode > 0 {
         let suffix = format!(":{season}:{episode}");
@@ -47,10 +54,11 @@ pub async fn aggregate_streams(
         let client_clone = client.clone();
         let id_clone = stream_id.clone();
         let m_type = media_type.to_string();
+        let wait = super::models::request_timeout(&addon.manifest_url, 10);
 
         tasks.push(async move {
             let streams_res = tokio::time::timeout(
-                std::time::Duration::from_millis(10000),
+                wait,
                 client_clone.fetch_streams(&base_url, &m_type, &id_clone),
             )
             .await;

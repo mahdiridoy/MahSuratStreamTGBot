@@ -449,6 +449,16 @@ pub struct InstalledAddon {
     pub types: Vec<String>,
 }
 
+/// Free hosts (Render, ...) go to sleep and need a long time to wake up.
+pub fn is_slow_host(url: &str) -> bool {
+    url.contains("onrender.com")
+}
+
+/// How long to wait for one answer from this addon.
+pub fn request_timeout(url: &str, normal_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(if is_slow_host(url) { 45 } else { normal_secs })
+}
+
 /// Addons built into the bot. They work with no manual setup and are merged
 /// with whatever is saved in `addons_config.json` (user entries win).
 pub const BUILTIN_ADDON_MANIFESTS: &[(&str, &str)] = &[
@@ -479,6 +489,10 @@ pub const BUILTIN_ADDON_MANIFESTS: &[(&str, &str)] = &[
         "https://addon.notorrent2.workers.dev/manifest.json",
     ),
     (
+        "BanglaPlex",
+        "https://banglaplex-94zf.onrender.com/manifest.json",
+    ),
+    (
         "HDHub",
         "https://hdhub.thevolecitor.qzz.io/eyJ0b3Jib3giOiJ1bnNldCIsInF1YWxpdGllcyI6IjIxNjBwLDEwODBwLDcyMHAiLCJzb3J0IjoiZGVzYyJ9/manifest.json",
     ),
@@ -505,16 +519,21 @@ impl InstalledAddon {
     /// Used when a built-in addon's manifest cannot be fetched right now:
     /// assume it is a stream addon for IMDb (`tt`) ids.
     pub fn builtin_fallback(name: &str, manifest_url: &str) -> Self {
+        let bangla = name == "BanglaPlex";
         Self {
             manifest_url: manifest_url.to_string(),
             name: name.to_string(),
             version: None,
             description: Some("Built-in addon".to_string()),
             enabled: true,
-            provides_catalog: false,
-            provides_meta: false,
+            provides_catalog: bangla,
+            provides_meta: bangla,
             provides_stream: true,
-            id_prefixes: vec!["tt".to_string()],
+            id_prefixes: if bangla {
+                vec!["tt".to_string(), "bpx-".to_string()]
+            } else {
+                vec!["tt".to_string()]
+            },
             types: vec!["movie".to_string(), "series".to_string()],
         }
     }

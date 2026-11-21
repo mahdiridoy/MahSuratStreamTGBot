@@ -11,11 +11,11 @@ pub use aggregator::aggregate_streams;
 pub use client::AddonClient;
 pub use models::{
     AddonManifest, BUILTIN_ADDON_MANIFESTS, InstalledAddon, MetaDetail, MetaItem, StreamItem,
+    is_slow_host, request_timeout,
 };
 
 use crate::providers::models::{CatalogItem, MediaDetails, ProviderError, ProviderKind, Release};
 use crate::providers::{Provider, ProviderCapabilities, ReleaseProvider};
-use std::time::Duration;
 
 /// Saved addons (`addons_config.json`) plus the built-in ones that are not saved yet.
 /// Built-in manifests are fetched (cached) to learn what each addon provides.
@@ -31,7 +31,7 @@ pub async fn load_effective_addons(client: &AddonClient) -> Vec<InstalledAddon> 
         .collect();
 
     let futs = missing.into_iter().map(|(name, url)| async move {
-        match tokio::time::timeout(Duration::from_secs(6), client.fetch_manifest(url)).await {
+        match tokio::time::timeout(request_timeout(url, 12), client.fetch_manifest(url)).await {
             Ok(Ok(manifest)) => InstalledAddon::from_manifest(url.to_string(), &manifest),
             _ => InstalledAddon::builtin_fallback(name, url),
         }
@@ -50,7 +50,7 @@ impl AddonClient {
             ];
         }
         let manifest = match tokio::time::timeout(
-            Duration::from_secs(6),
+            request_timeout(&addon.manifest_url, 12),
             self.fetch_manifest(&addon.manifest_url),
         )
         .await
@@ -129,12 +129,13 @@ impl Provider for AddonClient {
         let tasks = catalog_addons.into_iter().map(|addon| async move {
             let base_url = Self::base_addon_url(&addon.manifest_url);
             let targets = self.search_targets(&addon).await;
+            let wait = request_timeout(&addon.manifest_url, 10);
             let mut found: Vec<MetaItem> = Vec::new();
             let searches = targets.iter().map(|(media_type, catalog_id)| {
                 let base_url = base_url.clone();
                 async move {
                     tokio::time::timeout(
-                        Duration::from_secs(10),
+                        wait,
                         self.fetch_catalog_search(&base_url, media_type, catalog_id, query),
                     )
                     .await
@@ -145,9 +146,16 @@ impl Provider for AddonClient {
                     found.extend(metas);
                 }
             }
-            // Stream addons are queried by IMDb id, so keep only items they can resolve.
+            // Keep IMDb ids (every stream addon understands them) and the addon's
+            // own ids (e.g. BanglaPlex "bpx-...").
             if !addon.is_core() {
-                found.retain(|m| m.id.starts_with("tt"));
+                found.retain(|m| {
+                    m.id.starts_with("tt")
+                        || addon
+                            .id_prefixes
+                            .iter()
+                            .any(|p| !p.is_empty() && m.id.starts_with(p.as_str()))
+                });
             }
             found
         });
