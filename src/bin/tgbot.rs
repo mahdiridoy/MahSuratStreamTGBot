@@ -119,10 +119,14 @@ impl Tg {
 #[derive(Default, Clone)]
 struct ChatState {
     query: String,
+    /// Providers that did not answer the last search (shown under the results)
+    note: String,
     /// Titles merged from all providers (same name + release year)
     groups: Vec<Group>,
     /// Details of the chosen title from every provider that has it
     members: Vec<(ProviderKind, MediaDetails)>,
+    /// Providers whose details failed to load: their stream ids are still used
+    fallback: Vec<(ProviderKind, String)>,
     /// Details used for the card and the season / episode lists
     primary: Option<MediaDetails>,
     /// "Name (Year)" of the chosen title
@@ -339,6 +343,14 @@ fn year_of(y: Option<&str>) -> String {
     String::new()
 }
 
+/// Release years of the same title often differ by one between providers.
+fn years_close(a: &str, b: &str) -> bool {
+    match (a.parse::<i32>(), b.parse::<i32>()) {
+        (Ok(x), Ok(y)) => (x - y).abs() <= 1,
+        _ => false,
+    }
+}
+
 fn distinct_providers(members: &[(ProviderKind, CatalogItem)]) -> usize {
     let mut seen: Vec<ProviderKind> = Vec::new();
     for (p, _) in members {
@@ -367,7 +379,7 @@ fn build_groups(results: &[(ProviderKind, Vec<CatalogItem>)]) -> Vec<Group> {
                 let poster = it.poster_url.clone().filter(|u| u.starts_with("http"));
                 let pos = keys
                     .iter()
-                    .position(|(kt, ky)| *kt == nt && (y.is_empty() || *ky == y));
+                    .position(|(kt, ky)| *kt == nt && (y.is_empty() || years_close(ky, &y)));
                 match pos {
                     Some(i) => {
                         let g = &mut groups[i];
@@ -424,19 +436,44 @@ async fn do_search(ctx: &Ctx, chat: i64, query: &str) {
     let outs = futures::future::join_all(futs).await;
 
     let mut results: Vec<(ProviderKind, Vec<CatalogItem>)> = Vec::new();
+    let mut failed: Vec<&'static str> = Vec::new();
     for (p, r) in outs {
-        if let Ok(Ok(items)) = r {
-            if !items.is_empty() {
-                results.push((p, items));
+        match r {
+            Ok(Ok(items)) => {
+                eprintln!("[search] {} -> {} results", p.label(), items.len());
+                if !items.is_empty() {
+                    results.push((p, items));
+                }
+            }
+            Ok(Err(ProviderError::NotFound)) => {
+                eprintln!("[search] {} -> no results", p.label());
+            }
+            Ok(Err(e)) => {
+                eprintln!("[search] {} failed: {e:?}", p.label());
+                if !p.is_bdix() {
+                    failed.push(p.label());
+                }
+            }
+            Err(_) => {
+                eprintln!("[search] {} timed out", p.label());
+                if !p.is_bdix() {
+                    failed.push(p.label());
+                }
             }
         }
     }
     let groups = build_groups(&results);
     let q = query.to_string();
+    let note = if failed.is_empty() {
+        String::new()
+    } else {
+        format!("⚠️ Not responding: {}", failed.join(", "))
+    };
     st_set(ctx, chat, |s| {
         *s = ChatState::default();
         s.query = q;
         s.groups = groups;
+        s.note = note;
     });
     show_results(ctx, chat, wait, 0).await;
 }
@@ -446,10 +483,13 @@ async fn show_results(ctx: &Ctx, chat: i64, msg: Option<i64>, page: usize) {
     let st = st_get(ctx, chat);
     let total = st.groups.len();
     if total == 0 {
-        let text = format!(
+        let mut text = format!(
             "No results for <b>{}</b>. Try another name.",
             esc(&st.query)
         );
+        if !st.note.is_empty() {
+            text.push_str(&format!("\n\n{}", esc(&st.note)));
+        }
         show(ctx, chat, msg, &text, None).await;
         return;
     }
@@ -478,13 +518,16 @@ async fn show_results(ctx: &Ctx, chat: i64, msg: Option<i64>, page: usize) {
     if !nav.is_empty() {
         rows.push(nav);
     }
-    let text = format!(
+    let mut text = format!(
         "Results for <b>{}</b>\n\n✅ Total results: {}\nShowing {}-{}\n\nPick a title:",
         esc(&st.query),
         total,
         start + 1,
         end
     );
+    if !st.note.is_empty() {
+        text.push_str(&format!("\n\n{}", esc(&st.note)));
+    }
     show(ctx, chat, msg, &text, Some(kb(rows))).await;
 }
 
@@ -533,7 +576,7 @@ fn card(d: &MediaDetails, providers: usize) -> String {
 /// A title was picked: load its details from every provider that has it.
 async fn open_group(ctx: &Ctx, chat: i64, gi: usize) {
     let st = st_get(ctx, chat);
-    let Some(group) = st.groups.get(gi).cloned() else {
+    let Some(mut group) = st.groups.get(gi).cloned() else {
         expired(ctx, chat).await;
         return;
     };
@@ -543,28 +586,77 @@ async fn open_group(ctx: &Ctx, chat: i64, gi: usize) {
         .await
         .ok();
 
+    // Look the title up again, by its exact name, on every provider that does
+    // not have it yet: a provider's top results for the typed words can miss it.
+    let gnt = norm_title(&group.title);
+    let missing: Vec<ProviderKind> = BOT_PROVIDERS
+        .iter()
+        .copied()
+        .filter(|p| !group.members.iter().any(|(mp, _)| mp == p))
+        .collect();
+    let lookups = missing.into_iter().map(|p| {
+        let svc = ctx.svc.clone();
+        let title = group.title.clone();
+        async move {
+            let r =
+                tokio::time::timeout(Duration::from_secs(12), svc.search_typed(p, &title, 1)).await;
+            (p, r)
+        }
+    });
+    let found = futures::future::join_all(lookups).await;
+    for (p, r) in found {
+        let Ok(Ok(items)) = r else {
+            continue;
+        };
+        let mut added = 0;
+        for it in items {
+            let y = year_of(it.year.as_deref());
+            let same_year = y.is_empty() || group.year.is_empty() || years_close(&group.year, &y);
+            let same_kind = (it.media_type == MediaType::Series) == group.series;
+            let dup = group
+                .members
+                .iter()
+                .any(|(mp, mi)| *mp == p && mi.id.value == it.id.value);
+            if added < 2
+                && group.members.len() < 12
+                && same_kind
+                && same_year
+                && !dup
+                && norm_title(&it.title) == gnt
+            {
+                group.members.push((p, it));
+                added += 1;
+            }
+        }
+    }
+
     let futs = group.members.iter().map(|(p, item)| {
         let svc = ctx.svc.clone();
         let p = *p;
         let id = item.id.value.clone();
         async move {
             let r = tokio::time::timeout(Duration::from_secs(30), svc.details_typed(p, &id)).await;
-            (p, r)
+            (p, id, r)
         }
     });
     let outs = futures::future::join_all(futs).await;
 
     let mut members: Vec<(ProviderKind, MediaDetails)> = Vec::new();
+    let mut fallback: Vec<(ProviderKind, String)> = Vec::new();
     let mut first_err: Option<String> = None;
-    for (p, r) in outs {
+    for (p, id, r) in outs {
         match r {
             Ok(Ok(d)) => members.push((p, d)),
             Ok(Err(e)) => {
+                eprintln!("[details] {} failed: {e:?}", p.label());
+                fallback.push((p, id));
                 if first_err.is_none() {
                     first_err = Some(e.user_message(p));
                 }
             }
             Err(_) => {
+                eprintln!("[details] {} timed out", p.label());
+                fallback.push((p, id));
                 if first_err.is_none() {
                     first_err = Some(format!("{} timed out loading details.", p.label()));
                 }
@@ -627,6 +719,7 @@ async fn open_group(ctx: &Ctx, chat: i64, gi: usize) {
     let p2 = primary.clone();
     st_set(ctx, chat, |s| {
         s.members = members;
+        s.fallback = fallback;
         s.primary = Some(p2);
         s.title = title;
         s.season = 0;
@@ -812,6 +905,21 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
                 provider: *p,
                 subject_id: id,
                 siblings: siblings.clone(),
+            });
+        }
+    }
+
+    // Providers whose details failed still get asked for streams by their id.
+    for (p, id) in &st.fallback {
+        if !id.is_empty()
+            && !targets
+                .iter()
+                .any(|t| t.provider == *p && t.subject_id == *id)
+        {
+            targets.push(Target {
+                provider: *p,
+                subject_id: id.clone(),
+                siblings: Vec::new(),
             });
         }
     }
@@ -2415,5 +2523,36 @@ mod tests {
         assert_eq!(fmt_hms(59), "00:00:59");
         assert_eq!(fmt_hms(0), "00:00:00");
         assert!(unlocked_text("x", 3661).contains("01:01:01"));
+    }
+
+    #[test]
+    fn release_years_one_apart_still_match() {
+        assert!(years_close("2018", "2019"));
+        assert!(years_close("2018", "2018"));
+        assert!(!years_close("2018", "2020"));
+        assert!(!years_close("", "2018"));
+        let results = vec![
+            (
+                ProviderKind::MovieBox,
+                vec![item(
+                    ProviderKind::MovieBox,
+                    "m1",
+                    "Bachelor Point",
+                    Some("2018"),
+                )],
+            ),
+            (
+                ProviderKind::Addons,
+                vec![item(
+                    ProviderKind::Addons,
+                    "series:tt1",
+                    "Bachelor Point",
+                    Some("2019"),
+                )],
+            ),
+        ];
+        let groups = build_groups(&results);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(distinct_providers(&groups[0].members), 2);
     }
 }
