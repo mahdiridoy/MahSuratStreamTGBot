@@ -20,21 +20,20 @@ jobs:
 
       - name: Verify Source
         run: |
-          test -d MovieBox-Tui-main || {
+          test -d MahSuratStreamTGBot-main || {
             echo "Source folder not found!"
             exit 1
           }
 
-          test -n "$(find MovieBox-Tui-main -mindepth 1 -print -quit)" || {
+          test -n "$(find MahSuratStreamTGBot-main -mindepth 1 -print -quit)" || {
             echo "Source folder is empty!"
             exit 1
           }
 
       - name: Transfer All Files
         run: |
-          cp -a MovieBox-Tui-main/. .
-          rm -rf MovieBox-Tui-main
-
+          cp -a MahSuratStreamTGBot-main/. .
+          rm -rf MahSuratStreamTGBot-main
       - name: Commit and Push
         run: |
           git config user.name "github-actions[bot]"
