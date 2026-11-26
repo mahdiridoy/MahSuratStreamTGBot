@@ -1,0 +1,16 @@
+# Render Blueprint: one free web service that runs the Telegram bot 24/7.
+services:
+  - type: web
+    name: mahsurat-stream-bot
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    # New versions are deployed by the "Bot Release" workflow (Deploy Hook),
+    # after the new binary is published.
+    autoDeploy: false
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ALLOWED_CHAT_IDS
+        sync: false
