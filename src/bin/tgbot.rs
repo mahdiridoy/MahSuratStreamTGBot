@@ -152,6 +152,8 @@ struct Target {
     siblings: Vec<String>,
     /// Per-season titles use their own season number (usually 1)
     season_override: Option<usize>,
+    /// Audio language of this source (MovieBox dubs)
+    audio: Option<String>,
 }
 
 /// A provider title that is exactly one season of a series ("Show S2").
@@ -223,20 +225,76 @@ fn kb(rows: Vec<Vec<Value>>) -> Value {
     json!({"inline_keyboard": rows})
 }
 
-fn rel_label(r: &Release) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    parts.push(r.quality.clone().unwrap_or_else(|| "Auto".to_string()));
+/// Which provider / addon a link comes from ("MovieBox", "HdHub", "Torrentio", ...).
+fn provider_name(r: &Release) -> String {
+    match r.provider {
+        ProviderKind::Addons => r
+            .source_label()
+            .split(" · ")
+            .next()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .unwrap_or("Addons")
+            .to_string(),
+        p => p.label().to_string(),
+    }
+}
+
+/// Extra source text (uploader / stream title), when it adds something.
+fn source_detail(r: &Release) -> Option<String> {
+    let src = r.source_label().trim();
+    let detail = match r.provider {
+        ProviderKind::Addons => src.split_once(" · ").map(|(_, b)| b.trim()).unwrap_or(""),
+        _ => src,
+    };
+    if detail.is_empty()
+        || detail.eq_ignore_ascii_case("direct")
+        || detail.eq_ignore_ascii_case(&provider_name(r))
+    {
+        None
+    } else {
+        Some(detail.to_string())
+    }
+}
+
+fn language_of(r: &Release) -> Option<String> {
+    r.language
+        .as_ref()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+}
+
+/// Short text for a button: "1080p • 3.23 GB • Hindi • MovieBox".
+fn rel_short(r: &Release) -> String {
+    let mut parts: Vec<String> = vec![r.quality.clone().unwrap_or_else(|| "Auto".to_string())];
     if let Some(sz) = r.size_bytes {
         parts.push(fmt_size(sz));
     }
-    if let Some(l) = r.language.as_ref().filter(|l| !l.trim().is_empty()) {
-        parts.push(l.trim().to_string());
+    if let Some(l) = language_of(r) {
+        parts.push(short(&l, 14));
+    }
+    parts.push(short(&provider_name(r), 14));
+    parts.join(" • ")
+}
+
+/// Full text for the message: quality, size, audio language, codec, provider.
+fn rel_full(r: &Release) -> String {
+    let mut parts: Vec<String> = vec![r.quality.clone().unwrap_or_else(|| "Auto".to_string())];
+    if let Some(sz) = r.size_bytes {
+        parts.push(fmt_size(sz));
+    }
+    if let Some(l) = language_of(r) {
+        parts.push(l);
     }
     if let Some(c) = r.codec.as_ref().filter(|c| !c.trim().is_empty()) {
         parts.push(c.trim().to_string());
     }
-    parts.push(r.source_label().to_string());
-    short(&parts.join(" • "), 60)
+    let mut source = provider_name(r);
+    if let Some(d) = source_detail(r) {
+        source.push_str(&format!(" · {d}"));
+    }
+    parts.push(source);
+    parts.join(" • ")
 }
 
 fn episode_tag(st: &ChatState) -> String {
@@ -1046,11 +1104,18 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
             {
                 continue;
             }
+            let audio = d
+                .dubs
+                .iter()
+                .find(|x| x.subject_id == id)
+                .map(|x| x.language.trim().to_string())
+                .filter(|l| !l.is_empty() && !l.eq_ignore_ascii_case("unknown"));
             targets.push(Target {
                 provider: *p,
                 subject_id: id,
                 siblings: siblings.clone(),
                 season_override,
+                audio,
             });
         }
     }
@@ -1067,6 +1132,7 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
                 subject_id: id.clone(),
                 siblings: Vec::new(),
                 season_override: None,
+                audio: None,
             });
         }
     }
@@ -1167,6 +1233,13 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
         show(ctx, chat, target_msg, &text, None).await;
         return;
     }
+    // MovieBox does not say which language a source is in: take it from the dub.
+    for (rel, ti) in tagged.iter_mut() {
+        if rel.provider == ProviderKind::MovieBox && language_of(rel).is_none() {
+            let audio = targets.get(*ti).and_then(|t| t.audio.clone());
+            rel.language = Some(audio.unwrap_or_else(|| "Original audio".to_string()));
+        }
+    }
     tagged.sort_by(|a, b| {
         b.0.resolution_u64()
             .cmp(&a.0.resolution_u64())
@@ -1191,15 +1264,32 @@ async fn show_qualities(ctx: &Ctx, chat: i64, msg: Option<i64>) {
         .enumerate()
         .filter(|(i, _)| !st.dead.contains(i))
         .collect();
-    for (i, r) in live.iter().take(MAX_QUALITY_BUTTONS) {
-        rows.push(vec![cb(&rel_label(r), format!("r:{i}"))]);
+    for (n, (i, r)) in live.iter().take(MAX_QUALITY_BUTTONS).enumerate() {
+        rows.push(vec![cb(
+            &short(&format!("{}. {}", n + 1, rel_short(r)), 60),
+            format!("r:{i}"),
+        )]);
     }
-    let text = format!(
-        "<b>{}</b>{}\nChoose quality / source ({} available):",
+    // Telegram cannot scroll text on buttons, so the full details of every
+    // option are listed in the message (long lines wrap onto more lines).
+    let mut text = format!(
+        "<b>{}</b>{}\nChoose quality / source ({} available):\n",
         esc(&st.title),
         esc(&episode_tag(&st)),
         live.len()
     );
+    let mut shown = 0usize;
+    for (n, (_, r)) in live.iter().take(MAX_QUALITY_BUTTONS).enumerate() {
+        let line = format!("\n{}. {}", n + 1, esc(&rel_full(r)));
+        if text.len() + line.len() > 3600 {
+            break;
+        }
+        text.push_str(&line);
+        shown += 1;
+    }
+    if shown < live.len().min(MAX_QUALITY_BUTTONS) {
+        text.push_str("\n\n… more options are in the buttons below.");
+    }
     show(ctx, chat, msg, &text, Some(kb(rows))).await;
 }
 
@@ -1453,7 +1543,7 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
         "<b>{}</b>{}\n{}\n",
         esc(&title),
         esc(&episode_tag(&st)),
-        esc(&rel_label(&rel))
+        esc(&rel_full(&rel))
     );
     let base = ctx.base.lock().ok().and_then(|g| g.clone());
     let Some(base) = base else {
@@ -3404,5 +3494,77 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(missing.status(), 200);
+    }
+
+    fn release(
+        p: ProviderKind,
+        q: &str,
+        lang: Option<&str>,
+        codec: &str,
+        label: &str,
+        size: u64,
+    ) -> Release {
+        use moviebox_tui::providers::models::SourceMirror;
+        Release {
+            provider: p,
+            filename: String::new(),
+            quality: Some(q.to_string()),
+            codec: Some(codec.to_string()),
+            language: lang.map(str::to_string),
+            size_bytes: Some(size),
+            season: None,
+            episode: None,
+            mirrors: vec![SourceMirror {
+                label: label.to_string(),
+                resolver_url: "https://x/y".to_string(),
+                headers: Vec::new(),
+                direct_file: true,
+            }],
+            resource_id: None,
+        }
+    }
+
+    #[test]
+    fn labels_show_audio_language_and_provider() {
+        let gb = 1_073_741_824u64;
+        let mb = release(
+            ProviderKind::MovieBox,
+            "1080p",
+            Some("Hindi"),
+            "h264",
+            "Promise",
+            3 * gb,
+        );
+        assert_eq!(rel_short(&mb), "1080p • 3.00 GB • Hindi • MovieBox");
+        assert_eq!(
+            rel_full(&mb),
+            "1080p • 3.00 GB • Hindi • h264 • MovieBox · Promise"
+        );
+
+        let ad = release(
+            ProviderKind::Addons,
+            "1080p",
+            Some("Bengali"),
+            "AVC/x264",
+            "BanglaPlex · 1080p Bachelor Point",
+            2 * gb,
+        );
+        assert_eq!(provider_name(&ad), "BanglaPlex");
+        assert_eq!(rel_short(&ad), "1080p • 2.00 GB • Bengali • BanglaPlex");
+        assert_eq!(
+            rel_full(&ad),
+            "1080p • 2.00 GB • Bengali • AVC/x264 • BanglaPlex · 1080p Bachelor Point"
+        );
+
+        // no language known: nothing invented
+        let k = release(
+            ProviderKind::FourKHdHub,
+            "2160p",
+            None,
+            "HEVC",
+            "4KHDHub",
+            gb,
+        );
+        assert_eq!(rel_short(&k), "2160p • 1.00 GB • 4KHDHub");
     }
 }
