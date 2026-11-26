@@ -168,6 +168,16 @@ jobs:
           NOTES
           gh release create bot-latest out/* --repo "$REPO" --title "Telegram Bot (latest)" --notes-file notes.md --target "${{ github.sha }}"
 
+      - name: Redeploy on Render (optional)
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          if [ -n "$RENDER_DEPLOY_HOOK" ]; then
+            curl -fsS -X POST "$RENDER_DEPLOY_HOOK" && echo "Render redeploy started"
+          else
+            echo "RENDER_DEPLOY_HOOK not set - skipping"
+          fi
+
       - name: Update Scoop manifest
         run: |
           HASH=$(sha256sum out/MovieBoxBot_Windows_x64.zip | awk '{print $1}')

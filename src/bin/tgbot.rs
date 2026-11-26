@@ -2131,6 +2131,11 @@ async fn serve_conn(
         }
     }
     let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+    // For uptime monitors (UptimeRobot, Render health check).
+    if path == "/health" || path == "/" {
+        http_simple(&mut sock, 200, "OK", "text/plain", b"ok").await;
+        return;
+    }
     let get = |id: &str| -> Option<Stream> { streams.lock().ok().and_then(|g| g.get(id).cloned()) };
 
     let n: usize = query
@@ -2730,6 +2735,22 @@ fn write_config(token: &str, allow: &str) {
     }
 }
 
+/// On Render the bot pings its own public address every few minutes, so the
+/// free service is never idle (it falls asleep after 15 minutes without traffic).
+fn spawn_self_ping(public_url: String) {
+    tokio::spawn(async move {
+        let url = format!("{public_url}/health");
+        loop {
+            tokio::time::sleep(Duration::from_secs(240)).await;
+            let r = tokio::time::timeout(Duration::from_secs(30), probe_client().get(&url).send())
+                .await;
+            if !matches!(r, Ok(Ok(_))) {
+                eprintln!("[self-ping] no answer from {public_url}");
+            }
+        }
+    });
+}
+
 /// Free hosts (Render) fall asleep after a few idle minutes and then need up to
 /// a minute to wake up. Ping the sleepy built-in addons now and every 10 minutes.
 fn spawn_keep_warm() {
@@ -2822,7 +2843,15 @@ async fn main() {
         .or_else(|| read_config("allow"))
         .unwrap_or_default();
     let on_github = std::env::var("GITHUB_ACTIONS").is_ok();
-    if !on_github {
+    // Hosted (Render): the public https address of this service. PUBLIC_URL can
+    // be set by hand; Render provides RENDER_EXTERNAL_URL itself.
+    let public_url: Option<String> = std::env::var("PUBLIC_URL")
+        .ok()
+        .or_else(|| std::env::var("RENDER_EXTERNAL_URL").ok())
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| u.starts_with("http"));
+    let hosted = public_url.is_some();
+    if !on_github && !hosted {
         write_config(&token, &allow_raw);
     }
     let allowed: Vec<i64> = allow_raw
@@ -2844,12 +2873,30 @@ async fn main() {
         streams: Arc::new(Mutex::new(HashMap::new())),
     };
 
-    match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+    let bind_addr = if hosted {
+        let port = std::env::var("PORT").unwrap_or_else(|_| "10000".to_string());
+        format!("0.0.0.0:{port}")
+    } else {
+        "127.0.0.1:0".to_string()
+    };
+    match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(listener) => {
             let port = listener.local_addr().map(|a| a.port()).unwrap_or(8787);
             spawn_keep_warm();
             tokio::spawn(server_task(listener, ctx.streams.clone(), ctx.tg.clone()));
-            tokio::spawn(tunnel_task(ctx.base.clone(), port));
+            match public_url.clone() {
+                Some(url) => {
+                    // Hosted: the service already has a public https address.
+                    if let Ok(mut g) = ctx.base.lock() {
+                        *g = Some(url.clone());
+                    }
+                    println!("Public address: {url}");
+                    spawn_self_ping(url);
+                }
+                None => {
+                    tokio::spawn(tunnel_task(ctx.base.clone(), port));
+                }
+            }
         }
         Err(e) => eprintln!("player server failed to start: {e}"),
     }
@@ -2872,7 +2919,13 @@ async fn main() {
 
     println!(
         "Bot started ({})",
-        if on_github { "GitHub Actions" } else { "local" }
+        if on_github {
+            "GitHub Actions"
+        } else if hosted {
+            "hosted"
+        } else {
+            "local"
+        }
     );
     let deadline: Option<Instant> =
         run_minutes.map(|m| Instant::now() + Duration::from_secs(m * 60));
@@ -3320,5 +3373,36 @@ mod tests {
             .to_string();
         assert!(disp.contains("Show S01E01 1080p.ts"), "{disp}");
         assert_eq!(dl.bytes().await.unwrap().as_ref(), b"AAAABBBB");
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_answers_for_uptime_monitors() {
+        let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bot = listener.local_addr().unwrap();
+        tokio::spawn(server_task(listener, streams, Tg::new("test")));
+        let http = reqwest::Client::new();
+        for path in ["/health", "/"] {
+            let r = http
+                .get(format!("http://{bot}{path}"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 200);
+            assert_eq!(r.text().await.unwrap(), "ok");
+        }
+        let head = http
+            .head(format!("http://{bot}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.status(), 200);
+        // unknown stream ids are still refused
+        let missing = http
+            .get(format!("http://{bot}/s/doesnotexist?n=0"))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(missing.status(), 200);
     }
 }
