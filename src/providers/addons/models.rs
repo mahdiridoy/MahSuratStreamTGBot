@@ -485,8 +485,16 @@ pub const BUILTIN_ADDON_MANIFESTS: &[(&str, &str)] = &[
         "https://top-streaming.stream/manifest.json",
     ),
     (
+        "Anilist",
+        "https://anilist-search.onrender.com/manifest.json",
+    ),
+    (
         "NoTorrent",
         "https://addon.notorrent2.workers.dev/manifest.json",
+    ),
+    (
+        "Hyper",
+        "https://hyper.stravo.site/local/manifest.json",
     ),
     (
         "BanglaPlex",
