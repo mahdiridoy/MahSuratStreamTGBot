@@ -122,6 +122,8 @@ struct ChatState {
     query: String,
     /// Providers that did not answer the last search (shown under the results)
     note: String,
+    /// What each provider returned for the chosen title (shown under the links)
+    streams_note: String,
     /// Titles merged from all providers (same name + release year)
     groups: Vec<Group>,
     /// Details of the chosen title from every provider that has it
@@ -432,6 +434,20 @@ fn clean_title(s: &str) -> String {
     }
 }
 
+/// "Avengers Endgame 2019" with release year 2019 -> "Avengers Endgame".
+fn strip_trailing_year(title: &str, year: &str) -> String {
+    let t = title.trim();
+    if year.len() == 4 {
+        if let Some(rest) = t.strip_suffix(year) {
+            let base = rest.trim_end();
+            if rest.ends_with(char::is_whitespace) && !base.is_empty() {
+                return base.to_string();
+            }
+        }
+    }
+    t.to_string()
+}
+
 /// First 4-digit year (19xx / 20xx) found in the text, or "".
 fn year_of(y: Option<&str>) -> String {
     let Some(y) = y else {
@@ -478,14 +494,15 @@ fn build_groups(results: &[(ProviderKind, Vec<CatalogItem>)]) -> Vec<Group> {
     for with_year in [true, false] {
         for (p, items) in results {
             for it in items {
-                let nt = norm_title(&it.title);
                 let y = year_of(it.year.as_deref());
+                let tt = strip_trailing_year(&it.title, &y);
+                let nt = norm_title(&tt);
                 if nt.is_empty() || y.is_empty() == with_year {
                     continue;
                 }
                 let series = it.media_type == MediaType::Series;
                 let poster = it.poster_url.clone().filter(|u| u.starts_with("http"));
-                let has_suffix = split_season(&it.title).1.is_some();
+                let has_suffix = split_season(&tt).1.is_some();
                 let pos = keys.iter().enumerate().position(|(i, (kt, ky))| {
                     *kt == nt && (y.is_empty() || has_suffix || suffixed[i] || years_close(ky, &y))
                 });
@@ -513,7 +530,7 @@ fn build_groups(results: &[(ProviderKind, Vec<CatalogItem>)]) -> Vec<Group> {
                         keys.push((nt, y.clone()));
                         suffixed.push(has_suffix);
                         groups.push(Group {
-                            title: split_season(&it.title).0,
+                            title: split_season(&tt).0,
                             year: y,
                             series,
                             poster,
@@ -736,7 +753,7 @@ async fn open_group(ctx: &Ctx, chat: i64, gi: usize) {
                 && same_kind
                 && same_year
                 && !dup
-                && norm_title(&it.title) == gnt
+                && norm_title(&strip_trailing_year(&it.title, &y)) == gnt
             {
                 group.members.push((p, it));
                 added += 1;
@@ -1051,6 +1068,52 @@ async fn provider_streams(
 
 /// Fetch the streams of this title from every provider at the same time and
 /// merge them into one list.
+/// What one provider returned for the chosen title.
+#[derive(Default)]
+struct Summary {
+    found: usize,
+    hidden: usize,
+    why: Option<String>,
+    hidden_why: Option<String>,
+}
+
+fn summary_mut(list: &mut [(ProviderKind, Summary)], p: ProviderKind) -> Option<&mut Summary> {
+    list.iter_mut().find(|(q, _)| *q == p).map(|(_, s)| s)
+}
+
+/// "Sources: MovieBox 14 • 4KHDHub 0 (no streams) • Addons 3 (2 hidden)".
+fn sources_note(
+    summary: &[(ProviderKind, Summary)],
+    shown_of: &dyn Fn(ProviderKind) -> usize,
+    absent: &[&str],
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (p, sm) in summary {
+        let shown = shown_of(*p);
+        let mut part = format!("{} {}", p.label(), shown);
+        if shown == 0 {
+            let why = if sm.hidden > 0 {
+                format!(
+                    "{} link(s) hidden: {}",
+                    sm.hidden,
+                    sm.hidden_why.clone().unwrap_or_default()
+                )
+            } else {
+                sm.why.clone().unwrap_or_else(|| "no streams".to_string())
+            };
+            part.push_str(&format!(" ({})", short(&why, 70)));
+        } else if sm.hidden > 0 {
+            part.push_str(&format!(" ({} hidden)", sm.hidden));
+        }
+        parts.push(part);
+    }
+    let mut note = format!("ℹ️ Sources: {}", parts.join(" • "));
+    if !absent.is_empty() {
+        note.push_str(&format!("\nNot found on: {}", absent.join(", ")));
+    }
+    note
+}
+
 async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
     let st = st_get(ctx, chat);
     let target_msg = match msg {
@@ -1143,11 +1206,15 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
         let id = t.subject_id.clone();
         let (season, episode) = (t.season_override.unwrap_or(st.season), st.episode);
         async move {
-            let r = tokio::time::timeout(
-                Duration::from_secs(45),
-                provider_streams(&svc, p, &id, season, episode),
-            )
-            .await;
+            let limit = Duration::from_secs(if p == ProviderKind::Addons { 60 } else { 45 });
+            let mut r =
+                tokio::time::timeout(limit, provider_streams(&svc, p, &id, season, episode)).await;
+            // One more try after a network hiccup.
+            if matches!(r, Ok(Err(ProviderError::Network(_)))) {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                r = tokio::time::timeout(limit, provider_streams(&svc, p, &id, season, episode))
+                    .await;
+            }
             (ti, p, r)
         }
     });
@@ -1155,19 +1222,49 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
 
     let mut tagged: Vec<(Release, usize)> = Vec::new();
     let mut errs: Vec<String> = Vec::new();
+    let mut summary: Vec<(ProviderKind, Summary)> = Vec::new();
+    for t in &targets {
+        if !summary.iter().any(|(p, _)| *p == t.provider) {
+            summary.push((t.provider, Summary::default()));
+        }
+    }
     for (ti, p, r) in outs {
         match r {
             Ok(Ok(v)) => {
+                eprintln!("[streams] {} -> {} links", p.label(), v.len());
+                if let Some(sm) = summary_mut(&mut summary, p) {
+                    sm.found += v.len();
+                    if v.is_empty() && sm.why.is_none() {
+                        sm.why = Some("no streams".to_string());
+                    }
+                }
                 if v.is_empty() {
                     errs.push(format!("{}: no streams", p.label()));
                 }
                 tagged.extend(v.into_iter().map(|x| (x, ti)));
             }
             Ok(Err(ProviderError::NotFound)) => {
+                eprintln!("[streams] {} -> not found", p.label());
+                if let Some(sm) = summary_mut(&mut summary, p) {
+                    sm.why.get_or_insert_with(|| "no streams found".to_string());
+                }
                 errs.push(format!("{}: no streams found", p.label()))
             }
-            Ok(Err(e)) => errs.push(e.user_message(p)),
-            Err(_) => errs.push(format!("{} timed out.", p.label())),
+            Ok(Err(e)) => {
+                eprintln!("[streams] {} failed: {e:?}", p.label());
+                let msg = e.user_message(p);
+                if let Some(sm) = summary_mut(&mut summary, p) {
+                    sm.why.get_or_insert_with(|| msg.clone());
+                }
+                errs.push(msg)
+            }
+            Err(_) => {
+                eprintln!("[streams] {} timed out", p.label());
+                if let Some(sm) = summary_mut(&mut summary, p) {
+                    sm.why.get_or_insert_with(|| "timed out".to_string());
+                }
+                errs.push(format!("{} timed out.", p.label()))
+            }
         }
     }
     let found_before_check = tagged.len();
@@ -1184,18 +1281,29 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
                 jobs.push((i, mi, m.resolver_url.clone(), m.headers.clone()));
             }
         }
-        let checked: Vec<(usize, usize, bool)> = futures::stream::iter(jobs)
+        let checked: Vec<(usize, usize, Result<bool, String>)> = futures::stream::iter(jobs)
             .map(|(i, mi, url, headers)| async move {
-                (i, mi, link_works(probe_client(), &url, &headers).await)
+                (i, mi, link_status(probe_client(), &url, &headers).await)
             })
             .buffer_unordered(40)
             .collect()
             .await;
-        let dead: std::collections::HashSet<(usize, usize)> = checked
-            .into_iter()
-            .filter(|(_, _, ok)| !ok)
-            .map(|(i, mi, _)| (i, mi))
+        let count_of = |tagged: &[(Release, usize)], p: ProviderKind| {
+            tagged.iter().filter(|(r, _)| r.provider == p).count()
+        };
+        let before: Vec<(ProviderKind, usize)> = summary
+            .iter()
+            .map(|(p, _)| (*p, count_of(&tagged, *p)))
             .collect();
+        let mut dead: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+        for (i, mi, res) in &checked {
+            if let Err(reason) = res {
+                dead.insert((*i, *mi));
+                if let Some(sm) = summary_mut(&mut summary, tagged[*i].0.provider) {
+                    sm.hidden_why.get_or_insert_with(|| reason.clone());
+                }
+            }
+        }
         for (i, (rel, _)) in tagged.iter_mut().enumerate() {
             if rel.provider == ProviderKind::FourKHdHub {
                 continue;
@@ -1209,7 +1317,24 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
         }
         tagged
             .retain(|(rel, _)| rel.provider == ProviderKind::FourKHdHub || !rel.mirrors.is_empty());
+        for (p, was) in before {
+            let now = count_of(&tagged, p);
+            if let Some(sm) = summary_mut(&mut summary, p) {
+                sm.hidden = was.saturating_sub(now);
+            }
+        }
     }
+    let asked: Vec<ProviderKind> = targets.iter().map(|t| t.provider).collect();
+    let absent: Vec<&str> = BOT_PROVIDERS
+        .iter()
+        .filter(|p| !p.is_bdix() && !asked.contains(p))
+        .map(|p| p.label())
+        .collect();
+    let streams_note = sources_note(
+        &summary,
+        &|p| tagged.iter().filter(|(r, _)| r.provider == p).count(),
+        &absent,
+    );
     if tagged.is_empty() {
         let mut text = "⚠️ No streams found for this item.".to_string();
         if found_before_check > 0 {
@@ -1221,12 +1346,6 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
         for e in errs.iter().take(8) {
             text.push_str(&format!("\n• {}", esc(&short(e, 140))));
         }
-        let asked: Vec<ProviderKind> = targets.iter().map(|t| t.provider).collect();
-        let absent: Vec<&str> = BOT_PROVIDERS
-            .iter()
-            .filter(|p| !p.is_bdix() && !asked.contains(p))
-            .map(|p| p.label())
-            .collect();
         if !absent.is_empty() {
             text.push_str(&format!("\n• Title not found on: {}", absent.join(", ")));
         }
@@ -1250,6 +1369,7 @@ async fn fetch_all(ctx: &Ctx, chat: i64, msg: Option<i64>) {
         s.targets = targets;
         s.releases = releases;
         s.rel_target = rel_target;
+        s.streams_note = streams_note;
         s.dead.clear();
     });
     show_qualities(ctx, chat, target_msg).await;
@@ -1279,9 +1399,10 @@ async fn show_qualities(ctx: &Ctx, chat: i64, msg: Option<i64>) {
         live.len()
     );
     let mut shown = 0usize;
+    let limit = 3500usize.saturating_sub(st.streams_note.len());
     for (n, (_, r)) in live.iter().take(MAX_QUALITY_BUTTONS).enumerate() {
         let line = format!("\n{}. {}", n + 1, esc(&rel_full(r)));
-        if text.len() + line.len() > 3600 {
+        if text.len() + line.len() > limit {
             break;
         }
         text.push_str(&line);
@@ -1289,6 +1410,9 @@ async fn show_qualities(ctx: &Ctx, chat: i64, msg: Option<i64>) {
     }
     if shown < live.len().min(MAX_QUALITY_BUTTONS) {
         text.push_str("\n\n… more options are in the buttons below.");
+    }
+    if !st.streams_note.is_empty() {
+        text.push_str(&format!("\n\n{}", esc(&st.streams_note)));
     }
     show(ctx, chat, msg, &text, Some(kb(rows))).await;
 }
@@ -1428,10 +1552,6 @@ async fn link_status(
         Some(t) => Err(format!("file is only {} MB", t / (1024 * 1024))),
         None => Err("file size unknown".to_string()),
     }
-}
-
-async fn link_works(http: &reqwest::Client, url: &str, headers: &[(String, String)]) -> bool {
-    link_status(http, url, headers).await.is_ok()
 }
 
 // ------------------------------------------------------------------ Links
@@ -3566,5 +3686,74 @@ mod tests {
             gb,
         );
         assert_eq!(rel_short(&k), "2160p • 1.00 GB • 4KHDHub");
+    }
+
+    #[test]
+    fn year_in_the_title_does_not_split_a_movie() {
+        assert_eq!(
+            strip_trailing_year("Avengers Endgame 2019", "2019"),
+            "Avengers Endgame"
+        );
+        assert_eq!(
+            strip_trailing_year("Blade Runner 2049", "2017"),
+            "Blade Runner 2049"
+        );
+        assert_eq!(strip_trailing_year("2019", "2019"), "2019");
+        let results = vec![
+            (
+                ProviderKind::Dramachi,
+                vec![item(
+                    ProviderKind::Dramachi,
+                    "d",
+                    "Avengers Endgame 2019",
+                    Some("2019"),
+                )],
+            ),
+            (
+                ProviderKind::Addons,
+                vec![item(
+                    ProviderKind::Addons,
+                    "movie:tt4154796",
+                    "Avengers: Endgame",
+                    Some("2019"),
+                )],
+            ),
+        ];
+        let groups = build_groups(&results);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].title, "Avengers Endgame");
+        assert_eq!(distinct_providers(&groups[0].members), 2);
+    }
+
+    #[test]
+    fn sources_line_explains_every_provider() {
+        let mb = Summary {
+            found: 14,
+            ..Default::default()
+        };
+        let k = Summary {
+            why: Some("no streams found".to_string()),
+            ..Default::default()
+        };
+        let ad = Summary {
+            found: 3,
+            hidden: 3,
+            hidden_why: Some("HTTP 403".to_string()),
+            ..Default::default()
+        };
+        let summary = vec![
+            (ProviderKind::MovieBox, mb),
+            (ProviderKind::FourKHdHub, k),
+            (ProviderKind::Addons, ad),
+        ];
+        let note = sources_note(
+            &summary,
+            &|p| if p == ProviderKind::MovieBox { 14 } else { 0 },
+            &["Dramachi"],
+        );
+        assert!(note.contains("MovieBox 14"));
+        assert!(note.contains("4KHDHub 0 (no streams found)"));
+        assert!(note.contains("Addons 0 (3 link(s) hidden: HTTP 403)"));
+        assert!(note.contains("Not found on: Dramachi"));
     }
 }
