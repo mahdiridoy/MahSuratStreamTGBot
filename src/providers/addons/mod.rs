@@ -40,6 +40,21 @@ pub async fn load_effective_addons(client: &AddonClient) -> Vec<InstalledAddon> 
     list
 }
 
+/// Saved addons plus the built-in ones, without any network request. Asking for
+/// streams must not wait for every addon's manifest (a sleeping host would eat
+/// the whole time limit and the answers of the fast addons would be lost).
+pub async fn load_stream_addons() -> Vec<InstalledAddon> {
+    let mut list = tokio::task::spawn_blocking(crate::config::load_addons)
+        .await
+        .unwrap_or_default();
+    for (name, url) in BUILTIN_ADDON_MANIFESTS {
+        if !list.iter().any(|a| a.manifest_url == *url) {
+            list.push(InstalledAddon::builtin_fallback(name, url));
+        }
+    }
+    list
+}
+
 impl AddonClient {
     /// (type, catalog id) pairs of an addon that can be searched.
     async fn search_targets(&self, addon: &InstalledAddon) -> Vec<(String, String)> {
@@ -79,7 +94,7 @@ impl ReleaseProvider for AddonClient {
         season: usize,
         episode: usize,
     ) -> Result<Vec<Release>, ProviderError> {
-        let addons = load_effective_addons(self).await;
+        let addons = load_stream_addons().await;
         let is_series = id.starts_with("series:") || season > 0;
         let (releases, blocked) =
             aggregate_streams(self, &addons, id, season, episode, is_series).await;

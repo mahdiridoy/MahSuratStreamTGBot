@@ -456,7 +456,7 @@ pub fn is_slow_host(url: &str) -> bool {
 
 /// How long to wait for one answer from this addon.
 pub fn request_timeout(url: &str, normal_secs: u64) -> std::time::Duration {
-    std::time::Duration::from_secs(if is_slow_host(url) { 45 } else { normal_secs })
+    std::time::Duration::from_secs(if is_slow_host(url) { 30 } else { normal_secs })
 }
 
 /// Addons built into the bot. They work with no manual setup and are merged
@@ -528,7 +528,7 @@ impl InstalledAddon {
             enabled: true,
             provides_catalog: bangla,
             provides_meta: bangla,
-            provides_stream: true,
+            provides_stream: name != "Netflix Catalog",
             id_prefixes: if bangla {
                 vec!["tt".to_string(), "bpx-".to_string()]
             } else {
