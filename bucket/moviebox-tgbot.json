@@ -1,9 +1,9 @@
 {
-  "version": "2026.11.26.21",
+  "version": "2026.11.27.24",
   "description": "MahSurat Stream Bot (search all providers, play in Telegram / MX Player / VLC)",
   "homepage": "https://github.com/mahdiridoy/MahSuratStreamTGBot",
   "license": "MIT|Apache-2.0",
   "url": "https://github.com/mahdiridoy/MahSuratStreamTGBot/releases/download/bot-latest/MovieBoxBot_Windows_x64.zip",
-  "hash": "340d5d86198e6104de5f78e0704b47e52ebf7795eae234d6677979459ab18e75",
+  "hash": "7f3ca4539dc17a7b02fda736fd8a3f4e33eb7d4b8cb4ac91fb63bc443886ef92",
   "bin": "moviebox-tgbot.exe"
 }
