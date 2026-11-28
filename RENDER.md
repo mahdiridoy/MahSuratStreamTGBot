@@ -43,7 +43,9 @@ tells Render to redeploy (about 1 minute). Without the hook, click **Manual Depl
 - **Free plan limits:** 512 MB memory, and a monthly outbound bandwidth allowance
   (check Render's pricing page for the current number). Play and Download traffic goes
   through the bot, so heavy downloading uses it up.
-- **Restarts:** Render restarts services now and then, and on every deploy. Open search
-  results and unlocked links are kept in memory, so they are lost on a restart; users just
-  search again.
+- **Restarts:** Render restarts services now and then, and on every deploy (including
+  every time you push new code). Open search results and unlocked links are kept in memory,
+  so they are lost on a restart. Before it stops, the bot edits the messages that still show
+  a countdown to say "The bot was restarted", and users just tap a quality again or search
+  again. Avoid deploying while people are watching.
 - **One copy only:** run the bot in one place at a time (Render, GitHub or your PC).
