@@ -2066,7 +2066,8 @@ fn download_name(base: &str, ext: &str) -> String {
 }
 
 /// Play buttons that appear after the ads were watched.
-fn play_keyboard(st: &Stream, webapp: bool) -> Value {
+/// Play / Download buttons. `copy` adds "Copy link" (needs a recent Telegram app).
+fn play_keyboard(st: &Stream, webapp: bool, copy: bool) -> Value {
     let mut rows: Vec<Vec<Value>> = Vec::new();
     for (i, it) in st.items.iter().enumerate() {
         let page = format!("{}?n={}", st.page, i);
@@ -2082,13 +2083,20 @@ fn play_keyboard(st: &Stream, webapp: bool) -> Value {
             json!({"text": "📱 MX Player", "url": format!("{page}&go=mx")}),
             json!({"text": "🎞 VLC", "url": format!("{page}&go=vlc")}),
         ]);
-        rows.push(vec![
-            json!({"text": "⬇️ Download", "url": dl_url(&st.page, i)}),
-        ]);
+        let dl = dl_url(&st.page, i);
+        let mut dl_row = vec![json!({"text": "⬇️ Download", "url": dl.clone()})];
+        if copy {
+            // Tapping copies the direct download link, for a download manager app.
+            dl_row.push(json!({"text": "📋 Copy link", "copy_text": {"text": dl}}));
+        }
+        rows.push(dl_row);
     }
     rows.push(vec![cb("⬅ Other qualities", "q".to_string())]);
     kb(rows)
 }
+
+/// Shown when a link is not known any more (the bot restarted or 6 hours passed).
+const LINK_GONE_TEXT: &[u8] = b"This link is no longer active: the bot was restarted or the 6 hours ended. Go back to the bot and tap the quality again.";
 
 /// How often the countdown in the message is refreshed (Telegram limits how
 /// fast a bot may edit a message, so it ticks every few seconds).
@@ -2106,7 +2114,7 @@ fn fmt_hms(secs: u64) -> String {
 
 fn unlocked_text(text: &str, secs_left: u64) -> String {
     format!(
-        "{text}\n\n✅ <b>Unlocked.</b> Tap Play or Download below.\n⏱ Time left: <b>{}</b> (hr:min:sec)",
+        "{text}\n\n✅ <b>Unlocked.</b> Tap Play or Download below.\n📋 Copy link = paste it into a download manager app (ADM, 1DM, IDM).\n⏱ Time left: <b>{}</b> (hr:min:sec)",
         fmt_hms(secs_left)
     )
 }
@@ -2400,23 +2408,24 @@ async fn serve_conn(
                 Err(_) => None,
             };
             let Some((st, newly)) = snapshot else {
-                http_simple(&mut sock, 404, "Not Found", "text/plain", b"Expired").await;
+                http_simple(&mut sock, 404, "Not Found", "text/plain", LINK_GONE_TEXT).await;
                 return;
             };
             if newly && st.msg != 0 {
                 let deadline =
                     st.unlocked_at.unwrap_or_else(Instant::now) + Duration::from_secs(UNLOCK_SECS);
                 let text = unlocked_text(&st.text, UNLOCK_SECS);
-                let mut keyboard = play_keyboard(&st, true);
-                if tg
-                    .edit(st.chat, st.msg, &text, Some(keyboard.clone()))
-                    .await
-                    .is_err()
-                {
-                    keyboard = play_keyboard(&st, false);
-                    let _ = tg
+                // Best keyboard first; fall back if Telegram refuses a button type.
+                let mut keyboard = play_keyboard(&st, true, true);
+                for (webapp, copy) in [(false, true), (false, false)] {
+                    if tg
                         .edit(st.chat, st.msg, &text, Some(keyboard.clone()))
-                        .await;
+                        .await
+                        .is_ok()
+                    {
+                        break;
+                    }
+                    keyboard = play_keyboard(&st, webapp, copy);
                 }
                 tokio::spawn(countdown_task(
                     tg.clone(),
@@ -2436,14 +2445,7 @@ async fn serve_conn(
 
     if let Some(id) = path.strip_prefix("/p/") {
         let Some(entry) = get(id) else {
-            http_simple(
-                &mut sock,
-                404,
-                "Not Found",
-                "text/plain",
-                b"Expired. Tap the quality again in the bot.",
-            )
-            .await;
+            http_simple(&mut sock, 404, "Not Found", "text/plain", LINK_GONE_TEXT).await;
             return;
         };
         let html = if entry.is_unlocked() {
@@ -2990,6 +2992,53 @@ fn spawn_self_ping(public_url: String) {
     });
 }
 
+fn restart_text(text: &str) -> String {
+    format!(
+        "{text}\n\n♻️ <b>The bot was restarted.</b> This link is no longer active. Tap a quality again (search again if the list is gone)."
+    )
+}
+
+/// Render stops the bot (SIGTERM) on every deploy and restart, and all links
+/// live in memory. Before exiting, tell the users whose messages still show a
+/// running countdown, so they do not tap a dead link.
+#[cfg(unix)]
+fn spawn_shutdown_notice(streams: StreamMap, tg: Tg) {
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        use tokio::signal::unix::{SignalKind, signal};
+        let Ok(mut term) = signal(SignalKind::terminate()) else {
+            return;
+        };
+        term.recv().await;
+        eprintln!("[shutdown] stopping: telling users their links ended");
+        let jobs: Vec<(i64, i64, String)> = streams
+            .lock()
+            .map(|g| {
+                g.values()
+                    .filter(|s| s.msg != 0)
+                    .map(|s| (s.chat, s.msg, s.text.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let work = futures::stream::iter(jobs)
+            .map(|(chat, msg, text)| {
+                let tg = tg.clone();
+                async move {
+                    let _ = tg
+                        .edit(chat, msg, &restart_text(&text), Some(kb(Vec::new())))
+                        .await;
+                }
+            })
+            .buffer_unordered(8)
+            .collect::<Vec<_>>();
+        let _ = tokio::time::timeout(Duration::from_secs(20), work).await;
+        std::process::exit(0);
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_shutdown_notice(_streams: StreamMap, _tg: Tg) {}
+
 /// Free hosts (Render) fall asleep after a few idle minutes and then need up to
 /// a minute to wake up. Ping the sleepy built-in addons now and every 10 minutes.
 fn spawn_keep_warm() {
@@ -3122,6 +3171,7 @@ async fn main() {
         Ok(listener) => {
             let port = listener.local_addr().map(|a| a.port()).unwrap_or(8787);
             spawn_keep_warm();
+            spawn_shutdown_notice(ctx.streams.clone(), ctx.tg.clone());
             tokio::spawn(server_task(listener, ctx.streams.clone(), ctx.tg.clone()));
             match public_url.clone() {
                 Some(url) => {
@@ -3812,5 +3862,46 @@ mod tests {
         assert!(page.contains("N=1"));
         assert!(page.contains("Watch 1 ad to unlock"));
         assert!(!page.contains("__ADS"));
+    }
+
+    #[test]
+    fn restart_notice_replaces_the_countdown() {
+        let t = restart_text("Alpha (2025)\n1080p");
+        assert!(t.starts_with("Alpha (2025)"));
+        assert!(t.contains("The bot was restarted"));
+        assert!(!t.contains("Time left"));
+        assert!(String::from_utf8_lossy(LINK_GONE_TEXT).contains("tap the quality again"));
+    }
+
+    #[test]
+    fn download_row_has_a_copy_link_button() {
+        let st = Stream {
+            items: vec![StreamItem {
+                name: "HdHub".to_string(),
+                url: "https://files.example.com/a.mkv".to_string(),
+                headers: Vec::new(),
+                hls: false,
+            }],
+            title: "Show".to_string(),
+            file_base: "Show".to_string(),
+            chat: 1,
+            msg: 2,
+            text: String::new(),
+            page: "https://bot.onrender.com/p/0123456789abcdef0123456789abcdef".to_string(),
+            unlocked_at: Some(Instant::now()),
+        };
+        let with = play_keyboard(&st, true, true).to_string();
+        let expect = "https://bot.onrender.com/d/0123456789abcdef0123456789abcdef?n=0";
+        assert!(with.contains(&format!(r#""copy_text":{{"text":"{expect}"}}"#)));
+        assert!(
+            expect.len() <= 256,
+            "Telegram allows 256 characters to copy"
+        );
+        // the plain Download button is still there
+        assert!(with.contains("Download"));
+        // the fallback keyboard has no copy button
+        let without = play_keyboard(&st, false, false).to_string();
+        assert!(!without.contains("copy_text"));
+        assert!(without.contains(expect));
     }
 }
