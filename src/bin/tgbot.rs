@@ -564,6 +564,125 @@ fn build_groups(results: &[(ProviderKind, Vec<CatalogItem>)]) -> Vec<Group> {
     groups
 }
 
+/// Small words that do not have to appear in a title.
+const STOPWORDS: &[&str] = &[
+    "the", "a", "an", "of", "and", "in", "on", "to", "for", "ki", "ka", "ke", "ko", "se", "hai",
+];
+
+/// Letters and digits only, lower case ("Spider-Man" -> "spiderman").
+fn compact(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur.push((prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// A typed word matches a title word when equal, a start of it, or one or two
+/// typing mistakes away.
+fn word_matches(q: &str, t: &str) -> bool {
+    let n = q.chars().count();
+    if q == t || (n >= 3 && t.starts_with(q)) {
+        return true;
+    }
+    let max = if n >= 8 {
+        2
+    } else if n >= 4 {
+        1
+    } else {
+        0
+    };
+    max > 0 && edit_distance(q, t) <= max
+}
+
+/// How well a title fits what was typed:
+/// 3 = the whole phrase is in the title, 2 = every word, 1 = most words, 0 = no.
+fn relevance(query: &str, title: &str) -> u8 {
+    let qn = norm_title(query);
+    let qwords: Vec<&str> = qn
+        .split_whitespace()
+        .filter(|w| !(w.len() == 4 && year_of(Some(w)) == **w))
+        .collect();
+    if qwords.is_empty() {
+        return 3;
+    }
+    // Filler words ("the", "of", "ki") are not keywords.
+    let strong: Vec<&str> = qwords
+        .iter()
+        .copied()
+        .filter(|w| !STOPWORDS.contains(w))
+        .collect();
+    let qwords = if strong.is_empty() { qwords } else { strong };
+    let tn = norm_title(title);
+    let twords: Vec<&str> = tn.split_whitespace().collect();
+    let qc = compact(&qwords.join(" "));
+    let tc = compact(&tn);
+    let phrase = if qc.chars().count() >= 4 {
+        tc.contains(&qc)
+    } else {
+        twords.iter().any(|t| *t == qc)
+    };
+    if phrase {
+        return 3;
+    }
+    let matched = qwords
+        .iter()
+        .filter(|q| twords.iter().any(|t| word_matches(q, t)))
+        .count();
+    if matched == qwords.len() {
+        2
+    } else if qwords.len() >= 2 && matched * 10 >= qwords.len() * 6 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Keyword match: keep the titles that contain every typed word (in any order,
+/// small spelling mistakes allowed); providers also send loosely related
+/// titles. If no title has every word, the ones with most words are kept; if
+/// nothing matches at all, everything is kept.
+fn filter_relevant(query: &str, groups: Vec<Group>) -> (Vec<Group>, usize) {
+    let score = |g: &Group| -> u8 {
+        g.members
+            .iter()
+            .map(|(_, it)| relevance(query, &it.title))
+            .chain(std::iter::once(relevance(query, &g.title)))
+            .max()
+            .unwrap_or(0)
+    };
+    let scores: Vec<u8> = groups.iter().map(score).collect();
+    let best = scores.iter().copied().max().unwrap_or(0);
+    if best == 0 {
+        return (groups, 0);
+    }
+    // 2 or 3 = every keyword is in the title; 1 = most of them.
+    let min = if best >= 2 { 2 } else { 1 };
+    let total = groups.len();
+    let kept: Vec<Group> = groups
+        .into_iter()
+        .zip(scores)
+        .filter(|(_, sc)| *sc >= min)
+        .map(|(g, _)| g)
+        .collect();
+    let hidden = total - kept.len();
+    (kept, hidden)
+}
+
 async fn do_search(ctx: &Ctx, chat: i64, query: &str) {
     let wait = ctx
         .tg
@@ -612,13 +731,19 @@ async fn do_search(ctx: &Ctx, chat: i64, query: &str) {
             }
         }
     }
-    let groups = build_groups(&results);
+    let (groups, hidden) = filter_relevant(query, build_groups(&results));
     let q = query.to_string();
-    let note = if failed.is_empty() {
+    let mut note = if failed.is_empty() {
         String::new()
     } else {
         format!("⚠️ Not responding: {}", failed.join(", "))
     };
+    if hidden > 0 {
+        if !note.is_empty() {
+            note.push('\n');
+        }
+        note.push_str(&format!("🔎 {hidden} unrelated result(s) hidden."));
+    }
     st_set(ctx, chat, |s| {
         *s = ChatState::default();
         s.query = q;
@@ -3903,5 +4028,78 @@ mod tests {
         let without = play_keyboard(&st, false, false).to_string();
         assert!(!without.contains("copy_text"));
         assert!(without.contains(expect));
+    }
+
+    #[test]
+    fn only_titles_that_match_the_search_are_listed() {
+        let titles: &[(&str, Option<&str>)] = &[
+            ("Awarapan 2", Some("2026")),
+            ("Saiyaara", Some("2025")),
+            ("Ek Deewane Ki Deewaniyat", Some("2025")),
+            ("Masameer Junior", Some("2025")),
+            ("Sanam Teri Deewangi Ki Kasam", Some("2020")),
+            ("Masamune-kun's Revenge", Some("2017")),
+            ("Sanam Teri Kasam", Some("2016")),
+            ("Kasam Teri Pyaar Ki", Some("2016")),
+            ("Aashiqui 2", Some("2013")),
+            ("Sanam Teri Kasam", Some("2009")),
+            ("Sanam Teri Kasam", Some("1982")),
+            ("Sanam Teri Kasam 2", None),
+            ("Dhatteriki", None),
+            ("Materialists", None),
+            ("Teri Baaton Mein Aisa Uljha Jiya", None),
+            ("Bhootteriki", None),
+        ];
+        let items: Vec<CatalogItem> = titles
+            .iter()
+            .enumerate()
+            .map(|(i, (t, y))| item(ProviderKind::MovieBox, &i.to_string(), t, *y))
+            .collect();
+        let groups = build_groups(&[(ProviderKind::MovieBox, items)]);
+        let all = groups.len();
+        let (kept, hidden) = filter_relevant("Sanam Teri kasam", groups);
+        let names: Vec<String> = kept
+            .iter()
+            .map(|g| format!("{} {}", g.title, g.year).trim().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                // newest first; every title has all three keywords
+                "Sanam Teri Deewangi Ki Kasam 2020",
+                "Sanam Teri Kasam 2016",
+                "Sanam Teri Kasam 2009",
+                "Sanam Teri Kasam 1982",
+                "Sanam Teri Kasam 2"
+            ]
+        );
+        assert_eq!(hidden, all - 5);
+    }
+
+    #[test]
+    fn matching_copes_with_typos_spaces_and_partial_words() {
+        // the phrase is found even when spaces / hyphens differ
+        assert_eq!(relevance("spiderman", "Spider-Man: No Way Home"), 3);
+        // a typo still finds the title
+        assert_eq!(relevance("sanam teri kasm", "Sanam Teri Kasam"), 2);
+        // a start of a word is enough while typing
+        assert_eq!(relevance("aveng endgame", "Avengers: Endgame"), 2);
+        // a year typed with the name does not hurt
+        assert_eq!(relevance("avengers endgame 2019", "Avengers: Endgame"), 3);
+        // unrelated
+        assert_eq!(relevance("sanam teri kasam", "Saiyaara"), 0);
+        // the words may be in any order
+        assert_eq!(relevance("kasam sanam teri", "Sanam Teri Kasam"), 2);
+        // filler words do not have to be in the title
+        assert_eq!(relevance("kasam ki sanam", "Sanam Kasam"), 2);
+        // a title with only some of the words is not a keyword match
+        assert_eq!(relevance("sanam teri kasam", "Kasam Teri Pyaar Ki"), 1);
+        // nothing matches at all: everything stays (no empty list)
+        let results = vec![(
+            ProviderKind::MovieBox,
+            vec![item(ProviderKind::MovieBox, "1", "Zzzz", Some("2020"))],
+        )];
+        let (kept, hidden) = filter_relevant("qwerty", build_groups(&results));
+        assert_eq!((kept.len(), hidden), (1, 0));
     }
 }
