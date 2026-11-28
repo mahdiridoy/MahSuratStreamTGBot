@@ -22,6 +22,18 @@ use moviebox_tui::providers::models::{
 use moviebox_tui::service::MovieBoxService;
 use serde_json::{Value, json};
 
+/// How many ads must be watched to unlock Play / Download.
+const ADS_REQUIRED: usize = 1;
+
+/// "1 ad" / "2 ads"
+fn ads_word(n: usize) -> String {
+    if n == 1 {
+        "1 ad".to_string()
+    } else {
+        format!("{n} ads")
+    }
+}
+
 const PAGE_ITEMS: usize = 10;
 const PAGE_EPISODES: usize = 30;
 const MAX_QUALITY_BUTTONS: usize = 90;
@@ -541,8 +553,14 @@ fn build_groups(results: &[(ProviderKind, Vec<CatalogItem>)]) -> Vec<Group> {
             }
         }
     }
-    // Titles that exist on more providers come first.
-    groups.sort_by_key(|g| std::cmp::Reverse(distinct_providers(&g.members)));
+    // Newest first, oldest last (no year = last). Same year: the title found
+    // on more providers first.
+    groups.sort_by(|a, b| {
+        let ya: i32 = a.year.parse().unwrap_or(0);
+        let yb: i32 = b.year.parse().unwrap_or(0);
+        yb.cmp(&ya)
+            .then_with(|| distinct_providers(&b.members).cmp(&distinct_providers(&a.members)))
+    });
     groups
 }
 
@@ -1726,8 +1744,10 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
     let sid = random_id();
     let page = format!("{}/p/{}", base.trim_end_matches('/'), sid);
     let base_text = short_html(&text);
-    let locked_text =
-        format!("{base_text}\n\n🔒 <b>Watch 2 short ads to unlock Play and Download.</b>");
+    let locked_text = format!(
+        "{base_text}\n\n🔒 <b>Watch {} to unlock Play and Download.</b>",
+        ads_word(ADS_REQUIRED)
+    );
     insert_stream(
         &ctx.streams,
         &sid,
@@ -1756,7 +1776,9 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
     }
     let back = vec![cb("⬅ Other qualities", "q".to_string())];
     let with_webapp = kb(vec![
-        vec![json!({"text": "🔓 Watch 2 ads to unlock", "web_app": {"url": page.clone()}})],
+        vec![
+            json!({"text": format!("🔓 Watch {} to unlock", ads_word(ADS_REQUIRED)), "web_app": {"url": page.clone()}}),
+        ],
         back.clone(),
     ]);
     match ctx.tg.send(chat, &locked_text, Some(with_webapp)).await {
@@ -1764,7 +1786,9 @@ async fn send_links(ctx: &Ctx, chat: i64, k: usize) {
         Err(_) => {
             // Mini-App buttons only work in private chats; fall back to a link button.
             let with_url = kb(vec![
-                vec![json!({"text": "🔓 Watch 2 ads to unlock", "url": page.clone()})],
+                vec![
+                    json!({"text": format!("🔓 Watch {} to unlock", ads_word(ADS_REQUIRED)), "url": page.clone()}),
+                ],
                 back,
             ]);
             if let Ok(mid) = ctx.tg.send(chat, &locked_text, Some(with_url)).await {
@@ -2041,7 +2065,7 @@ fn download_name(base: &str, ext: &str) -> String {
     format!("{name}.{ext}")
 }
 
-/// Play buttons that appear after the 2 ads were watched.
+/// Play buttons that appear after the ads were watched.
 fn play_keyboard(st: &Stream, webapp: bool) -> Value {
     let mut rows: Vec<Vec<Value>> = Vec::new();
     for (i, it) in st.items.iter().enumerate() {
@@ -2134,7 +2158,10 @@ async fn countdown_task(
     if let Ok(mut g) = streams.lock() {
         g.remove(&id);
     }
-    let t = format!("{text}\n\n⌛ <b>Expired.</b> Tap a quality again and watch 2 ads to play.");
+    let t = format!(
+        "{text}\n\n⌛ <b>Expired.</b> Tap a quality again and watch {} to play.",
+        ads_word(ADS_REQUIRED)
+    );
     let _ = tg
         .edit(
             chat,
@@ -2224,15 +2251,15 @@ button:disabled{opacity:.6}
 <h1>__TITLE__</h1>
 <div class="card">
 <h2>&#x1F512; Unlock playback</h2>
-<p>Watch 2 short ads to unlock the video and the download. It stays unlocked for 6 hours.</p>
-<div id="prog">Ads watched: 0 / 2</div>
-<button id="btn" type="button">&#x25B6; Watch ad 1 of 2</button>
+<p>Watch __ADS_TEXT__ to unlock the video and the download. It stays unlocked for 6 hours.</p>
+<div id="prog">Ads watched: 0 / __ADS_N__</div>
+<button id="btn" type="button">&#x25B6; Watch ad</button>
 <p id="msg"></p>
 </div>
 <script>
 var tg=window.Telegram&&window.Telegram.WebApp;
 if(tg){try{tg.ready();tg.expand();}catch(e){}}
-var done=0,busy=false;
+var done=0,busy=false,N=__ADS_N__;
 var btn=document.getElementById("btn"),prog=document.getElementById("prog"),msg=document.getElementById("msg");
 function adFn(){return (typeof show_12229158==="function")?show_12229158:null;}
 function unlock(){
@@ -2247,9 +2274,9 @@ btn.onclick=function(){
   if(!f){msg.textContent="The ad could not load. Check your connection, disable any ad-blocker and try again.";return;}
   busy=true;btn.disabled=true;msg.textContent="Loading ad...";
   f().then(function(){
-    done++;prog.textContent="Ads watched: "+done+" / 2";busy=false;btn.disabled=false;msg.textContent="";
-    if(done>=2){btn.style.display="none";unlock();}
-    else{btn.textContent="\u25B6 Watch ad "+(done+1)+" of 2";}
+    done++;prog.textContent="Ads watched: "+done+" / "+N;busy=false;btn.disabled=false;msg.textContent="";
+    if(done>=N){btn.style.display="none";unlock();}
+    else{btn.textContent="\u25B6 Watch ad "+(done+1)+" of "+N;}
   }).catch(function(){busy=false;btn.disabled=false;msg.textContent="The ad was not completed. Please watch it fully.";});
 };
 </script></body></html>"##;
@@ -2283,6 +2310,8 @@ fn gate_page(id: &str, title: &str) -> String {
     GATE_HTML
         .replace("__TITLE__", &esc(title))
         .replace("__ID__", id)
+        .replace("__ADS_TEXT__", &ads_word(ADS_REQUIRED))
+        .replace("__ADS_N__", &ADS_REQUIRED.to_string())
 }
 
 async fn http_simple(
@@ -2354,7 +2383,7 @@ async fn serve_conn(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    // Called by the gate page after both ads were watched.
+    // Called by the gate page after the required ads were watched.
     if method == "POST" {
         if let Some(id) = path.strip_prefix("/unlock/") {
             let snapshot: Option<(Stream, bool)> = match streams.lock() {
@@ -3755,5 +3784,33 @@ mod tests {
         assert!(note.contains("4KHDHub 0 (no streams found)"));
         assert!(note.contains("Addons 0 (3 link(s) hidden: HTTP 403)"));
         assert!(note.contains("Not found on: Dramachi"));
+    }
+
+    #[test]
+    fn results_are_listed_newest_first() {
+        let mk = |p, id: &str, title: &str, year: Option<&str>| item(p, id, title, year);
+        let results = vec![(
+            ProviderKind::MovieBox,
+            vec![
+                mk(ProviderKind::MovieBox, "1", "Alpha", Some("2012")),
+                mk(ProviderKind::MovieBox, "2", "Beta", Some("2026")),
+                mk(ProviderKind::MovieBox, "3", "Gamma", None),
+                mk(ProviderKind::MovieBox, "4", "Delta", Some("2019")),
+            ],
+        )];
+        let years: Vec<String> = build_groups(&results).into_iter().map(|g| g.year).collect();
+        // newest first; a title without a year goes last
+        assert_eq!(years, vec!["2026", "2019", "2012", ""]);
+    }
+
+    #[test]
+    fn one_ad_is_enough() {
+        assert_eq!(ADS_REQUIRED, 1);
+        assert_eq!(ads_word(1), "1 ad");
+        assert_eq!(ads_word(2), "2 ads");
+        let page = gate_page("abc", "Show");
+        assert!(page.contains("N=1"));
+        assert!(page.contains("Watch 1 ad to unlock"));
+        assert!(!page.contains("__ADS"));
     }
 }
